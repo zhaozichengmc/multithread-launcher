@@ -1,0 +1,133 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<style>
+  html,body{margin:0;padding:0;}
+  body{
+    width:900px;height:700px;background:linear-gradient(160deg,#eef2f7 0%,#dde4ee 100%);
+    font-family:"Noto Sans CJK SC","Microsoft YaHei UI",sans-serif;
+    position:relative;
+  }
+  .win{
+    position:absolute;left:69px;top:53px;
+    width:762px;height:593px;background:#f0f0f0;
+    border:1px solid #9a9a9a;box-sizing:border-box;
+    box-shadow:0 12px 30px rgba(20,35,60,.28),0 2px 6px rgba(20,35,60,.18);
+    overflow:hidden;
+  }
+  .titlebar{
+    height:31px;background:#fff;border-bottom:1px solid #d8d8d8;
+    display:flex;align-items:center;padding:0 10px;box-sizing:border-box;
+  }
+  .appicon{width:16px;height:16px;border-radius:3px;background:linear-gradient(135deg,#0a84ff,#0057c8);margin-right:8px;}
+  .title{font-size:12px;color:#000;}
+  .sysbtns{margin-left:auto;display:flex;height:31px;}
+  .sb{width:46px;height:31px;display:flex;align-items:center;justify-content:center;font-size:11px;color:#000;}
+  .client{position:absolute;left:1px;top:32px;width:760px;height:560px;background:#f0f0f0;}
+
+  .lbl{position:absolute;font-size:12px;color:#000;line-height:18px;white-space:nowrap;}
+  .lbl.gray{color:#808080;}
+
+  .tb{
+    position:absolute;box-sizing:border-box;background:#fff;border:1px solid #7a7a7a;
+    font-size:12px;color:#000;padding:0 4px;line-height:20px;height:22px;overflow:hidden;
+    white-space:nowrap;
+  }
+  .tb.disabled{background:#ececec;color:#6d6d6d;border-color:#a0a0a0;}
+  .tbarea{
+    position:absolute;box-sizing:border-box;background:#fafafa;border:1px solid #7a7a7a;
+    font-size:12px;color:#000;padding:3px 5px;overflow:hidden;line-height:17px;
+  }
+
+  .btn{
+    position:absolute;box-sizing:border-box;
+    background:linear-gradient(#f7f7f7,#e3e3e3);
+    border:1px solid #adadad;color:#000;font-size:12px;
+    display:flex;align-items:center;justify-content:center;
+  }
+  .btn.disabled{color:#a6a6a6;border-color:#c7c7c7;background:#f0f0f0;}
+  .btn.primary{background:#0078d4;border:none;color:#fff;font-size:13px;box-shadow:inset 0 0 0 1px rgba(255,255,255,.12);}
+  .btn.primary.disabled{background:#7fb3e6;color:#f4f9ff;}
+
+  .num{
+    position:absolute;box-sizing:border-box;width:62px;height:23px;background:#ececec;
+    border:1px solid #7a7a7a;display:flex;align-items:stretch;
+  }
+  .num .val{flex:1;background:#ececec;font-size:12px;color:#6d6d6d;display:flex;align-items:center;justify-content:flex-end;padding-right:4px;}
+  .num .spin{width:16px;display:flex;flex-direction:column;border-left:1px solid #a0a0a0;background:#f2f2f2;}
+  .num .spin div{flex:1;display:flex;align-items:center;justify-content:center;font-size:8px;color:#7a7a7a;line-height:1;}
+  .num .spin div:first-child{border-bottom:1px solid #cfcfcf;}
+
+  .bar{
+    position:absolute;box-sizing:border-box;height:22px;background:#e6e6e6;
+    border:1px solid #bcbcbc;overflow:hidden;
+  }
+  .bar .fill{position:absolute;left:1px;top:1px;bottom:1px;width:44%;background:#06b025;}
+  .bar .fill:after{
+    content:"";position:absolute;inset:0;
+    background:repeating-linear-gradient(90deg,transparent 0 6px,rgba(255,255,255,.55) 6px 7px);
+  }
+</style>
+</head>
+<body>
+<div class="win">
+  <div class="titlebar">
+    <div class="appicon"></div>
+    <div class="title">PCL 风格多线程下载器</div>
+    <div class="sysbtns">
+      <div class="sb">─</div><div class="sb">▢</div><div class="sb">✕</div>
+    </div>
+  </div>
+
+  <div class="client">
+    <div class="lbl" style="left:16px;top:14px;">下载地址（http/https 直链）</div>
+    <div class="tb disabled" style="left:16px;top:36px;width:650px;">https://mirrors.aliyun.com/win10/Win10_22H2_ChnSimp_x64.iso</div>
+    <div class="btn disabled" style="left:672px;top:35px;width:72px;height:26px;">粘贴</div>
+
+    <div class="lbl" style="left:16px;top:74px;">保存到</div>
+    <div class="tb disabled" style="left:16px;top:96px;width:650px;">D:\Downloads\Win10_22H2_ChnSimp_x64.iso</div>
+    <div class="btn disabled" style="left:672px;top:95px;width:72px;height:26px;">浏览…</div>
+
+    <div class="lbl" style="left:16px;top:134px;">线程数</div>
+    <div class="num" style="left:74px;top:132px;">
+      <div class="val">32</div>
+      <div class="spin"><div>▲</div><div>▼</div></div>
+    </div>
+    <div class="lbl gray" style="left:148px;top:137px;">建议 8~32（最多 256）</div>
+
+    <div class="btn primary disabled" style="left:404px;top:128px;width:108px;height:34px;">开始下载</div>
+    <div class="btn" style="left:518px;top:128px;width:92px;height:34px;">暂停</div>
+    <div class="btn" style="left:614px;top:128px;width:88px;height:34px;">取消</div>
+
+    <div class="bar" style="left:16px;top:178px;width:728px;">
+      <div class="fill"></div>
+    </div>
+
+    <div class="lbl" style="left:16px;top:206px;">下载中…</div>
+    <div class="lbl" style="left:16px;top:228px;">2.4 GB / 5.3 GB</div>
+    <div class="lbl" style="left:216px;top:228px;">速度 11.7 MB/s</div>
+    <div class="lbl" style="left:396px;top:228px;">剩余 3 分 58 秒</div>
+    <div class="lbl" style="left:556px;top:228px;">线程 32/32</div>
+
+    <div class="lbl gray" style="left:16px;top:256px;">日志</div>
+    <div class="tbarea" style="left:16px;top:278px;width:728px;height:230px;">
+      <div>21:27:01  文件大小 5.3 GB，服务器支持分段，最多 32 线程</div>
+      <div>21:27:01  切分新线程 #2：3187200000 ~ 5699999999（原线程止于 3187199999）</div>
+      <div>21:27:02  切分新线程 #3：2048000000 ~ 3187199999（原线程止于 2047999999）</div>
+      <div>21:27:02  切分新线程 #4：4556800000 ~ 5699999999（原线程止于 4556799999）</div>
+      <div>21:27:03  切分新线程 #5：1228800000 ~ 2047999999（原线程止于 1228799999）</div>
+      <div>21:27:03  切分新线程 #6：3932160000 ~ 4556799999（原线程止于 3932159999）</div>
+      <div>21:27:04  线程 #17 第 1 次失败：读取超时（30 秒无数据），1 秒后续传</div>
+      <div>21:27:05  线程 #17 续传成功，从 51200000 字节处继续</div>
+      <div>21:27:06  切分新线程 #12：786432000 ~ 1228799999（原线程止于 786431999）</div>
+      <div>21:27:07  切分新线程 #18：940900000 ~ 1024000000（原线程止于 940899999）</div>
+      <div>21:27:08  切分新线程 #24：4937000000 ~ 5120000000（原线程止于 4936999999）</div>
+      <div>21:27:09  已用 32 线程，平均 11.7 MB/s，进度 44%</div>
+    </div>
+
+    <div class="btn disabled" style="left:16px;top:518px;width:100px;height:28px;">打开文件</div>
+  </div>
+</div>
+</body>
+</html>

@@ -1,0 +1,22 @@
+# 构建产物
+src/bin/
+src/obj/
+发布/
+*.zip
+
+# 可执行文件放 Releases，不进仓库
+*.exe
+*.dll
+*.pdb
+
+# 运行时/本地配置（可能含账号令牌，绝对不能提交）
+account.json
+launch.tsv
+last_launch.txt
+authlib-injector.jar
+
+# 系统/编辑器
+.vs/
+.idea/
+*.user
+Thumbs.db
