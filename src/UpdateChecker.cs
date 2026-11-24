@@ -39,8 +39,8 @@ namespace PclDlGui
         private static readonly string[] ApiTemplates =
         {
             "https://api.github.com/repos/{0}/{1}/releases/latest",
-            "https://ghproxy.net/https://api.github.com/repos/{0}/{1}/releases/latest",
-            "https://gh-proxy.com/https://api.github.com/repos/{0}/{1}/releases/latest"
+            "https://gh-proxy.com/https://api.github.com/repos/{0}/{1}/releases/latest",
+            "https://ghproxy.net/https://api.github.com/repos/{0}/{1}/releases/latest"
         };
 
         public static string ApiUrl { get { return string.Format(ApiTemplates[0], Owner, Repo); } }
@@ -155,7 +155,7 @@ namespace PclDlGui
             Directory.CreateDirectory(dir);
             string dest = Path.Combine(dir, info.ExeName ?? "LightspeedDownloader.exe");
 
-            string[] tries = { info.ExeUrl, "https://ghproxy.net/" + info.ExeUrl, "https://gh-proxy.com/" + info.ExeUrl };
+            string[] tries = { info.ExeUrl, "https://gh-proxy.com/" + info.ExeUrl, "https://ghproxy.net/" + info.ExeUrl };
             Exception last = null;
             foreach (var url in tries)
             {
