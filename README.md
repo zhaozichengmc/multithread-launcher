@@ -111,3 +111,15 @@ MC 窗口下方新增「账号 / Java / 内存 / 启动游戏」：
   版本要求不足时自动换更合适的 Java；内存可选 1~8 GB
 - 第三方/正版令牌存 `%APPDATA%\PCLDownloader\account.json`，Java 与内存在 `launch.tsv`
 - 实测：1.7.10、b1.7.3、1.20.1 生成命令无残留 `${}`；微软 device code 接口真实返回设备码
+
+## 在线更新（v2.0 新增）
+
+程序自带更新器，直接从本仓库的 Releases 拉取新版本：
+
+- 启动 3 秒后静默检查一次；主界面右上「检查更新」可手动检查
+- 数据源：`https://api.github.com/repos/zhaozichengmc/multithread-launcher/releases/latest`，
+  api.github.com 连不上时自动切 `ghproxy.net` / `gh-proxy.com` 镜像
+- 版本号写在 `UpdateChecker.CurrentVersion`，与最新 tag（如 `V2.1`）逐段比较
+- 有新版时弹窗显示更新说明，可「下载并更新」：下载该版本的单文件 exe →
+  批处理等本进程退出后覆盖自身 → 重启，失败自动重试 12 次
+- 「打开发布页」直接跳到 `https://github.com/zhaozichengmc/multithread-launcher/releases`

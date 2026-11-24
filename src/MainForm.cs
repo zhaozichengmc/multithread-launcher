@@ -18,7 +18,7 @@ namespace PclDlGui
         private CheckBox chkDns, chkNet, chkClip;
         private RoundButton btnAdd, btnPaste, btnBrowse, btnOpenDir;
         private RoundButton btnStartAll, btnPauseAll, btnCancelAll, btnRetry, btnClear, btnSettings;
-        private RoundButton btnOpenFile, btnExport, btnBrowser, btnMc;
+        private RoundButton btnOpenFile, btnExport, btnBrowser, btnMc, btnUpdate;
         private ListView lv;
         private ComboBox cboAfter;
         private Label labOverall;
@@ -41,7 +41,7 @@ namespace PclDlGui
 
         public MainForm(string[] args)
         {
-            Text = "光速下载器";
+            Text = "光速下载器 " + UpdateChecker.CurrentVersion;
             Font = new Font("Microsoft YaHei UI", 9F);
             AutoScaleMode = AutoScaleMode.None;
             ClientSize = new Size(980, 730);
@@ -67,6 +67,15 @@ namespace PclDlGui
                 int nx = Math.Max(wa.Left, Math.Min(Left, wa.Right - Width));
                 int ny = Math.Max(wa.Top, Math.Min(Top, wa.Bottom - Height));
                 if (nx != Left || ny != Top) Location = new Point(nx, ny);
+
+                // 启动 3 秒后静默检查一次更新（只提示，不打扰）
+                var t = new Timer { Interval = 3000 };
+                t.Tick += (s2, e2) =>
+                {
+                    t.Stop(); t.Dispose();
+                    CheckUpdate(true);
+                };
+                t.Start();
             };
             DpiChanged += (s, e) =>
             {
@@ -161,6 +170,8 @@ namespace PclDlGui
             btnBrowser.Click += (s, e) => OpenBrowser();
             btnMc = Btn("下载 MC", x + 720, 178, 96, 32);
             btnMc.Click += (s, e) => OpenMc();
+            btnUpdate = Btn("检查更新", x + 824, 178, 96, 32);
+            btnUpdate.Click += (s, e) => CheckUpdate(false);
 
             lv = new ListView
             {
@@ -825,6 +836,41 @@ namespace PclDlGui
                         Log("设置已保存");
                 }
             }
+        }
+
+        private void CheckUpdate(bool silent)
+        {
+            if (btnUpdate != null) btnUpdate.Enabled = false;
+            if (!silent) Log("正在检查更新…");
+
+            var th = new System.Threading.Thread(() =>
+            {
+                ReleaseInfo info = null;
+                try { info = UpdateChecker.FetchLatest(); } catch { }
+                Ui(() =>
+                {
+                    if (btnUpdate != null) btnUpdate.Enabled = true;
+                    if (info == null)
+                    {
+                        if (!silent) Log("检查更新失败：连不上 GitHub（可稍后重试或手动打开发布页）");
+                        if (!silent) MessageBox.Show(this, "连不上 GitHub 发布页，检查下网络，或直接去\r\n" + UpdateChecker.ReleasesPage, "检查更新");
+                        return;
+                    }
+                    if (info.IsNewer)
+                    {
+                        Log("发现新版本 " + info.Tag + "（当前 " + UpdateChecker.CurrentVersion + "）");
+                        using (var f = new UpdateForm(info, true)) f.ShowDialog(this);
+                    }
+                    else
+                    {
+                        Log("已是最新版本 " + UpdateChecker.CurrentVersion);
+                        if (!silent)
+                            using (var f = new UpdateForm(info, false)) f.ShowDialog(this);
+                    }
+                });
+            });
+            th.IsBackground = true;
+            th.Start();
         }
 
         private void ExportLog()
