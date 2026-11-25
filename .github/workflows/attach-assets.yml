@@ -1,6 +1,7 @@
 name: Attach release assets
 
-# 网页上传接口近期对云端 IP 一直返回 500，改由 GitHub 自己的 runner 用 GITHUB_TOKEN 挂附件
+# 网页上传接口对云端 IP 一直返回 500，改由 GitHub 自己的 runner 用 GITHUB_TOKEN 挂附件。
+# 同时支持 push dist/ 自动触发（网页的 workflow_dispatch 按钮有时报 "Workflow could not be run"）。
 on:
   workflow_dispatch:
     inputs:
@@ -8,6 +9,9 @@ on:
         description: "目标 Release 标签，例如 V2.2"
         required: true
         default: "V2.2"
+  push:
+    paths:
+      - "dist/**"
 
 permissions:
   contents: write
@@ -21,11 +25,11 @@ jobs:
       - name: Upload assets to release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ github.event.inputs.tag }}
+          INPUT_TAG: ${{ github.event.inputs.tag }}
         run: |
           set -e
+          TAG="${INPUT_TAG:-V2.2}"
           ls -l dist
-          # 只取标签号里的版本数字，如 V2.2 -> 2.2
           VER="${TAG#V}"
           echo "tag=$TAG ver=$VER"
           shopt -s nullglob
