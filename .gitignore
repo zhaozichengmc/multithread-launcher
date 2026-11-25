@@ -20,3 +20,8 @@ authlib-injector.jar
 .idea/
 *.user
 Thumbs.db
+
+# 供 Actions 上传到 Release 的产物
+!dist/
+!dist/*.exe
+!dist/*.zip

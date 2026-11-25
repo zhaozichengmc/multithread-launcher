@@ -1,0 +1,39 @@
+name: Attach release assets
+
+# 网页上传接口近期对云端 IP 一直返回 500，改由 GitHub 自己的 runner 用 GITHUB_TOKEN 挂附件
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "目标 Release 标签，例如 V2.2"
+        required: true
+        default: "V2.2"
+
+permissions:
+  contents: write
+
+jobs:
+  attach:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Upload assets to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.event.inputs.tag }}
+        run: |
+          set -e
+          ls -l dist
+          # 只取标签号里的版本数字，如 V2.2 -> 2.2
+          VER="${TAG#V}"
+          echo "tag=$TAG ver=$VER"
+          shopt -s nullglob
+          files=()
+          for f in dist/*"$VER"*; do files+=("$f"); done
+          if [ ${#files[@]} -eq 0 ]; then echo "no files for $VER"; exit 1; fi
+          for f in "${files[@]}"; do
+            echo "uploading $f"
+            gh release upload "$TAG" "$f" --clobber
+          done
+          gh release view "$TAG" --json assets --jq '.assets[].name'
