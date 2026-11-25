@@ -27,8 +27,7 @@ namespace PclDlGui
 
         public BrowserForm(Action<string, string, string> onDownload)
         {
-            _onDownload = onDownload;
-            Text = "内置浏览器 · 点下载自动进队列";
+            _onDownload = onDownload;            Text = "内置浏览器 · 点下载自动进队列";
             Font = new Font("Microsoft YaHei UI", 9F);
             AutoScaleMode = AutoScaleMode.Dpi;
             AutoScaleDimensions = new SizeF(96F, 96F);
@@ -95,6 +94,18 @@ namespace PclDlGui
             Load += async (s, e) => await InitAsync();
         }
 
+        /// <summary>窗口可能已经关掉了，这时再碰控件会直接把程序带走</summary>
+        private void Ui(Action a)
+        {
+            if (a == null || IsDisposed || Disposing) return;
+            try
+            {
+                if (InvokeRequired) { if (IsHandleCreated) BeginInvoke(a); }
+                else a();
+            }
+            catch { }
+        }
+
         private async Task InitAsync()
         {
             if (_web == null) return;
@@ -106,26 +117,30 @@ namespace PclDlGui
                 Directory.CreateDirectory(dataDir);
 
                 var env = await CoreWebView2Environment.CreateAsync(null, dataDir, null);
+                if (IsDisposed || Disposing) return;
                 await _web.EnsureCoreWebView2Async(env);
+                if (IsDisposed || Disposing) return;
 
                 var core = _web.CoreWebView2;
+                if (core == null) return;
                 core.Settings.AreDefaultContextMenusEnabled = true;
                 core.Settings.AreDevToolsEnabled = false;
                 core.Settings.IsStatusBarEnabled = false;
                 core.DownloadStarting += Core_DownloadStarting;
                 core.NewWindowRequested += (s, ev) => { ev.Handled = true; try { core.Navigate(ev.Uri); } catch { } };
-                core.NavigationCompleted += (s, ev) =>
+                core.NavigationCompleted += (s, ev) => Ui(() =>
                 {
                     try { _txtAddr.Text = _web.Source != null ? _web.Source.ToString() : ""; } catch { }
-                    _labStatus.Text = ev.IsSuccess ? "就绪：网页里的下载会自动进队列" : "打开失败：" + ev.WebErrorStatus;
-                };
-                core.SourceChanged += (s, ev) =>
+                    if (_labStatus != null)
+                        _labStatus.Text = ev.IsSuccess ? "就绪：网页里的下载会自动进队列" : "打开失败：" + ev.WebErrorStatus;
+                });
+                core.SourceChanged += (s, ev) => Ui(() =>
                 {
                     try { _txtAddr.Text = _web.Source != null ? _web.Source.ToString() : ""; } catch { }
-                };
+                });
 
                 _ready = true;
-                _labStatus.Text = "就绪：网页里的下载会自动进队列";
+                if (_labStatus != null) _labStatus.Text = "就绪：网页里的下载会自动进队列";
                 if (!string.IsNullOrEmpty(_pendingUrl))
                 {
                     string pending = _pendingUrl;
@@ -140,8 +155,10 @@ namespace PclDlGui
             catch (Exception ex)
             {
                 _ready = false;
-                _labStatus.Text = "浏览器内核不可用：" + ex.Message + "。可装 WebView2 运行库，或点“系统浏览器”打开。";
-                _btnSystem.Visible = true;
+                if (IsDisposed || Disposing) return;
+                if (_labStatus != null)
+                    _labStatus.Text = "浏览器内核不可用：" + ex.Message + "。可装 WebView2 运行库，或点“系统浏览器”打开。";
+                if (_btnSystem != null) _btnSystem.Visible = true;
             }
         }
 
@@ -204,8 +221,9 @@ namespace PclDlGui
                 }
             }
             catch { }
+            if (IsDisposed || Disposing) return;
             _onDownload(url, referer, cookie);
-            _labStatus.Text = "已加入队列：" + url;
+            if (_labStatus != null) _labStatus.Text = "已加入队列：" + url;
         }
 
         /// <summary>
@@ -217,7 +235,7 @@ namespace PclDlGui
             string uri = "";
             try { uri = e.DownloadOperation.Uri; } catch { }
             e.Cancel = true;
-            if (string.IsNullOrEmpty(uri)) { _labStatus.Text = "拦截到一个下载，但拿不到地址"; return; }
+            if (string.IsNullOrEmpty(uri)) { Ui(() => { if (_labStatus != null) _labStatus.Text = "拦截到一个下载，但拿不到地址"; }); return; }
 
             string referer = "";
             string cookie = "";
@@ -231,15 +249,15 @@ namespace PclDlGui
             }
             catch { }
 
-            BeginInvoke((Action)(() =>
+            Ui(() =>
             {
                 try
                 {
                     _onDownload(uri, referer, cookie);
-                    _labStatus.Text = "已拦截并加入队列：" + uri;
+                    if (_labStatus != null) _labStatus.Text = "已拦截并加入队列：" + uri;
                 }
-                catch (Exception ex) { _labStatus.Text = "加入队列失败：" + ex.Message; }
-            }));
+                catch (Exception ex) { if (_labStatus != null) _labStatus.Text = "加入队列失败：" + ex.Message; }
+            });
         }
     }
 }

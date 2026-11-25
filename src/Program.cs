@@ -19,7 +19,17 @@ namespace PclDlGui
             bool created;
             using (var mutex = new Mutex(true, "PCLDownloader.SingleInstance.v2", out created))
             {
-                if (!created) return;   // 已有实例在运行，静默退出
+                if (!created)
+                {
+                    // 以前直接 return，用户双击第二次毫无反应，还以为程序坏了
+                    try
+                    {
+                        MessageBox.Show("光速下载器已经在运行了。\r\n如果看不到窗口，去任务栏右下角的通知区找一下。",
+                            "光速下载器", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    }
+                    catch { }
+                    return;
+                }
 
                 Application.EnableVisualStyles();
                 Application.SetCompatibleTextRenderingDefault(false);
@@ -43,6 +53,18 @@ namespace PclDlGui
                 string dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "PCLDownloader");
                 Directory.CreateDirectory(dir);
                 logPath = Path.Combine(dir, "crash.log");
+                // 日志轮转：反复崩时不会长到几百 MB
+                try
+                {
+                    var fi = new FileInfo(logPath);
+                    if (fi.Exists && fi.Length > 1024 * 1024)
+                    {
+                        string old = Path.Combine(dir, "crash.old.log");
+                        if (File.Exists(old)) File.Delete(old);
+                        File.Move(logPath, old);
+                    }
+                }
+                catch { }
                 var sb = new System.Text.StringBuilder();
                 sb.AppendLine("[" + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + "] " + where);
                 sb.AppendLine("版本：" + UpdateChecker.CurrentVersion + "    系统：" + Environment.OSVersion + "    " + (Environment.Is64BitProcess ? "x64" : "x86"));

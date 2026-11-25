@@ -43,113 +43,91 @@ namespace PclDl
             new Server { Ip = "9.9.9.9",     Name = "Quad9" },
         };
 
-        private static readonly ConcurrentDictionary<string, DnsChoice> Cache =
-            new ConcurrentDictionary<string, DnsChoice>();
+        private class CacheEntry
+        {
+            public long Time;
+            public Lazy<DnsChoice> Value;
+        }
 
-        private static readonly ConcurrentDictionary<string, long> CacheTime =
-            new ConcurrentDictionary<string, long>();
+        private static readonly ConcurrentDictionary<string, CacheEntry> Cache =
+            new ConcurrentDictionary<string, CacheEntry>();
 
-        private static readonly object PickLock = new object();
+        private static readonly long ClockBase = Stopwatch.GetTimestamp();
+        private static long Now()
+        {
+            return (long)((Stopwatch.GetTimestamp() - ClockBase) * (1000.0 / Stopwatch.Frequency));
+        }
 
-        /// <summary>缓存 5 分钟，避免每个分块都重测</summary>
+        /// <summary>
+        /// 缓存 5 分钟，避免每个分块都重测；同一域名并发请求只测一次（Lazy），
+        /// 不再用全局锁把别的任务卡在 4 秒里。
+        /// </summary>
         public static DnsChoice Pick(string host, int port, Action<string> log)
         {
             string key = host + ":" + port;
-            long now = Environment.TickCount;
-
-            long ts;
-            if (CacheTime.TryGetValue(key, out ts) && now - ts < 300000)
+            var entry = Cache.GetOrAdd(key, k => NewEntry(host, port, log));
+            if (Now() - entry.Time > 300000)
             {
-                DnsChoice c;
-                if (Cache.TryGetValue(key, out c) && c != null) return c;
+                var fresh = NewEntry(host, port, log);
+                if (Cache.TryUpdate(key, fresh, entry)) entry = fresh;
             }
+            try { return entry.Value.Value; } catch { return null; }
+        }
 
-            lock (PickLock)
+        private static CacheEntry NewEntry(string host, int port, Action<string> log)
+        {
+            var e = new CacheEntry { Time = Now() };
+            e.Value = new Lazy<DnsChoice>(() => Measure(host, port, log), LazyThreadSafetyMode.ExecutionAndPublication);
+            return e;
+        }
+
+        private static DnsChoice Measure(string host, int port, Action<string> log)
+        {
+            DnsChoice best = null;
+            var all = new List<DnsChoice>();
+            var gate = new object();
+            int pending = Servers.Length + 1;
+            var finished = new ManualResetEventSlim(false);
+
+            // 只在 finally 里减计数；以前 add() 也减一次，成功线程会让计数提前归零，只拿到最慢的几个结果
+            Action<DnsChoice> add = c =>
             {
-                if (CacheTime.TryGetValue(key, out ts) && now - ts < 300000)
+                if (c == null) return;
+                lock (gate)
                 {
-                    DnsChoice c2;
-                    if (Cache.TryGetValue(key, out c2) && c2 != null) return c2;
+                    all.Add(c);
+                    if (best == null || Score(c) < Score(best)) best = c;
                 }
+            };
 
-                DnsChoice best = null;
-                var all = new List<DnsChoice>();
-                var gate = new object();
-                int pending = Servers.Length + 1;
-                var finished = new ManualResetEventSlim(false);
-
-                Action<DnsChoice> add = c =>
-                {
-                    if (c == null) return;
-                    lock (gate)
-                    {
-                        all.Add(c);
-                        if (best == null || Score(c) < Score(best)) best = c;
-                    }
-                    if (Interlocked.Decrement(ref pending) == 0) finished.Set();
-                };
-
-                foreach (var s in Servers)
-                {
-                    var sv = s;
-                    ThreadPool.QueueUserWorkItem(_ =>
-                    {
-                        try
-                        {
-                            var ips = QueryA(sv.Ip, host, 1500);
-                            if (ips.Count == 0) return;
-                            int dnsMs = LastQueryMs;
-
-                            int bestTcp = int.MaxValue;
-                            string bestIp = null;
-                            foreach (var ip in ips)
-                            {
-                                int t = TcpPing(ip, port, 2000);
-                                if (t >= 0 && t < bestTcp) { bestTcp = t; bestIp = ip; }
-                            }
-                            if (bestIp == null) return;
-
-                            add(new DnsChoice
-                            {
-                                Server = sv.Ip,
-                                ServerName = sv.Name,
-                                Ip = bestIp,
-                                DnsMs = dnsMs,
-                                TcpMs = bestTcp
-                            });
-                        }
-                        catch { }
-                        finally
-                        {
-                            if (Interlocked.Decrement(ref pending) == 0) finished.Set();
-                        }
-                    });
-                }
-
-                // 系统 DNS 也参与比较，免得公共 DNS 反而不如运营商
+            foreach (var s in Servers)
+            {
+                var sv = s;
                 ThreadPool.QueueUserWorkItem(_ =>
                 {
                     try
                     {
-                        var addrs = Dns.GetHostAddresses(host);
+                        var ips = QueryA(sv.Ip, host, 1500);
+                        if (ips.Count == 0) return;
+                        int dnsMs = LastQueryMs;
+
                         int bestTcp = int.MaxValue;
                         string bestIp = null;
-                        foreach (var a in addrs)
+                        foreach (var ip in ips)
                         {
-                            if (a.AddressFamily != AddressFamily.InterNetwork) continue;
-                            int t = TcpPing(a.ToString(), port, 2000);
-                            if (t >= 0 && t < bestTcp) { bestTcp = t; bestIp = a.ToString(); }
+                            int t = TcpPing(ip, port, 2000);
+                            if (t >= 0 && t < bestTcp) { bestTcp = t; bestIp = ip; }
                         }
-                        if (bestIp != null)
-                            add(new DnsChoice
-                            {
-                                Server = "系统",
-                                ServerName = "系统 DNS",
-                                Ip = bestIp,
-                                DnsMs = 0,
-                                TcpMs = bestTcp,
-                                FromSystem = true
-                            });
+                        if (bestIp == null) return;
+
+                        add(new DnsChoice
+                        {
+                            Server = sv.Ip,
+                            ServerName = sv.Name,
+                            Ip = bestIp,
+                            DnsMs = dnsMs,
+                            TcpMs = bestTcp
+                        });
                     }
                     catch { }
                     finally
@@ -157,26 +135,53 @@ namespace PclDl
                         if (Interlocked.Decrement(ref pending) == 0) finished.Set();
                     }
                 });
-
-                finished.Wait(4000);
-
-                if (log != null)
-                {
-                    foreach (var c in all)
-                        log(string.Format("DNS 测试 {0,-12} {1,4}ms  → {2}（握手 {3}ms）",
-                            c.ServerName, c.DnsMs, c.Ip, c.TcpMs));
-                }
-
-                if (best != null)
-                {
-                    Cache[key] = best;
-                    CacheTime[key] = now;
-                    if (log != null)
-                        log(string.Format("DNS 优选结果：{0}（{1}）→ {2}", best.ServerName, best.Server, best.Ip));
-                }
-
-                return best;
             }
+
+            // 系统 DNS 也参与比较，免得公共 DNS 反而不如运营商
+            ThreadPool.QueueUserWorkItem(_ =>
+            {
+                try
+                {
+                    var addrs = Dns.GetHostAddresses(host);
+                    int bestTcp = int.MaxValue;
+                    string bestIp = null;
+                    foreach (var a in addrs)
+                    {
+                        if (a.AddressFamily != AddressFamily.InterNetwork) continue;
+                        int t = TcpPing(a.ToString(), port, 2000);
+                        if (t >= 0 && t < bestTcp) { bestTcp = t; bestIp = a.ToString(); }
+                    }
+                    if (bestIp != null)
+                        add(new DnsChoice
+                        {
+                            Server = "系统",
+                            ServerName = "系统 DNS",
+                            Ip = bestIp,
+                            DnsMs = 0,
+                            TcpMs = bestTcp,
+                            FromSystem = true
+                        });
+                }
+                catch { }
+                finally
+                {
+                    if (Interlocked.Decrement(ref pending) == 0) finished.Set();
+                }
+            });
+
+            finished.Wait(4000);
+
+            if (log != null)
+            {
+                foreach (var c in all)
+                    log(string.Format("DNS 测试 {0,-12} {1,4}ms  → {2}（握手 {3}ms）",
+                        c.ServerName, c.DnsMs, c.Ip, c.TcpMs));
+            }
+
+            if (best != null && log != null)
+                log(string.Format("DNS 优选结果：{0}（{1}）→ {2}", best.ServerName, best.Server, best.Ip));
+
+            return best;
         }
 
         private static double Score(DnsChoice c)
@@ -191,27 +196,44 @@ namespace PclDl
             get { return _lastQueryMs; }
         }
 
-        /// <summary>发一个 A 查询，返回 A 记录；overhead=true 时顺便记录耗时</summary>
+        /// <summary>发一个 A 查询，返回 A 记录；只接受来自目标 DNS、ID 与 QR 位都对得上的应答</summary>
         private static List<string> QueryA(string dnsServer, string host, int timeoutMs)
         {
             var result = new List<string>();
-            long t0 = Environment.TickCount;
+            long t0 = Stopwatch.GetTimestamp();
+            ushort id = (ushort)(Stopwatch.GetTimestamp() & 0xFFFF);
+            byte[] packet = BuildQuery(host, id);
 
-            byte[] packet = BuildQuery(host, (ushort)(Environment.TickCount & 0xFFFF));
             using (var udp = new UdpClient())
             {
-                udp.Client.ReceiveTimeout = timeoutMs;
                 try
                 {
+                    udp.Client.ReceiveTimeout = timeoutMs;
                     udp.Send(packet, packet.Length, dnsServer, 53);
-                    var ep = new IPEndPoint(IPAddress.Any, 0);
-                    byte[] resp = udp.Receive(ref ep);
-                    ParseAnswers(resp, result);
+
+                    while (true)
+                    {
+                        int spent = (int)((Stopwatch.GetTimestamp() - t0) * 1000 / Stopwatch.Frequency);
+                        if (spent >= timeoutMs) break;
+                        udp.Client.ReceiveTimeout = Math.Max(50, timeoutMs - spent);
+
+                        var ep = new IPEndPoint(IPAddress.Any, 0);
+                        byte[] resp = udp.Receive(ref ep);
+
+                        // 应答过滤：来源地址、事务 ID、QR 位任一不符就丢掉，防止伪造应答污染解析结果
+                        if (ep.Address.ToString() != dnsServer) continue;
+                        if (resp.Length < 12) continue;
+                        if (Be16(resp, 0) != id) continue;
+                        if ((resp[2] & 0x80) == 0) continue;
+
+                        ParseAnswers(resp, result);
+                        break;
+                    }
                 }
                 catch { }
             }
 
-            _lastQueryMs = (int)(Environment.TickCount - t0);
+            _lastQueryMs = (int)((Stopwatch.GetTimestamp() - t0) * 1000 / Stopwatch.Frequency);
             return result;
         }
 

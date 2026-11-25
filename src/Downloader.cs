@@ -1,12 +1,13 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Net;
 using System.Net.Http;
-using System.Net.Http.Headers;
 using System.Security.Cryptography;
-using System.Text.RegularExpressions;
+using System.Text;
 using System.Threading;
+using System.Threading.Tasks;
 
 namespace PclDl
 {
@@ -53,10 +54,29 @@ namespace PclDl
         public string TempPath;
         public int Index;
 
+        /// <summary>该分块当前使用的源（主源或镜像），各分块独立，避免混源</summary>
+        public string Url;
+        /// <summary>0 表示主源，1..N 表示第 N 个镜像</summary>
+        public int SourceIndex;
+
+        /// <summary>该分块是否有线程在跑（暂停没收干净时不重复开线程）</summary>
+        public volatile bool Alive;
+
+        public long Length
+        {
+            get { return Interlocked.Read(ref End) - Start + 1; }
+        }
+
         public long Remaining
         {
-            get { return Interlocked.Read(ref End) - Start + 1 - Interlocked.Read(ref Done); }
+            get { return Length - Interlocked.Read(ref Done); }
         }
+    }
+
+    /// <summary>内部信号：收到暂停请求，正常收尾而不是当成错误</summary>
+    internal class PauseSignal : Exception
+    {
+        public PauseSignal() : base("已暂停") { }
     }
 
     /// <summary>
@@ -68,6 +88,7 @@ namespace PclDl
         private const long PieceLimit = 262144;
         private const long NoSplitSize = 1048576;   // 小于 1MB 不分块
         private const int BufferSize = 16384;
+        private const int ReadTimeoutMs = 30000;
 
         public string Url;
         public string SavePath;
@@ -80,7 +101,7 @@ namespace PclDl
         /// <summary>代理；null 表示跟随系统</summary>
         public ProxyConfig Proxy;
 
-        /// <summary>备用镜像地址，主源失败后自动轮换</summary>
+        /// <summary>备用镜像地址，主源失败后自动轮换（按分块各自轮换）</summary>
         public List<string> Mirrors = new List<string>();
 
         /// <summary>期望的 SHA-256（小写十六进制）；填了就校验</summary>
@@ -112,23 +133,30 @@ namespace PclDl
         private volatile bool _cancel;
         private volatile bool _fatal;
         private volatile string _fatalMsg;
-        private int _mirrorTries;
         private int _recoverRounds;
         private volatile int _active;
 
         private long _speed;
-        private int _srcIdx;
-        private long _doneSnapshot;
-
         private Thread _runThread;
         private volatile bool _singleMode;
         private long _singleDone;
 
+        /// <summary>探测后确定的主源（镜像切换时以它为基准）</summary>
+        private string _baseUrl;
+
         public DlState State { get; private set; }
+
+        // 单调时钟：Environment.TickCount 49.7 天会溢出成负数，速度和超时全乱
+        private static readonly long ClockBase = Stopwatch.GetTimestamp();
+        private static long Now()
+        {
+            return (long)((Stopwatch.GetTimestamp() - ClockBase) * (1000.0 / Stopwatch.Frequency));
+        }
 
         public MultiThreadDownloader(string url, string savePath, int maxThreads, bool optimizeDns = true)
         {
             Url = url;
+            _baseUrl = url;
             SavePath = savePath;
             MaxThreads = Math.Max(1, Math.Min(256, maxThreads));
             OptimizeDns = optimizeDns;
@@ -246,7 +274,7 @@ namespace PclDl
 
         public void Pause()
         {
-            if (State != DlState.Downloading) return;
+            if (State != DlState.Downloading && State != DlState.Probing) return;
             _pause = true;
             Log("收到暂停请求，等待线程收尾…");
         }
@@ -257,6 +285,7 @@ namespace PclDl
             _pause = false;
             _runThread = new Thread(ResumeRun);
             _runThread.IsBackground = true;
+            _runThread.Name = "下载调度";
             _runThread.Start();
         }
 
@@ -289,6 +318,7 @@ namespace PclDl
                 EnsureDir();
                 Report(DlState.Probing, "正在探测文件大小…");
                 Probe();
+                _baseUrl = Url;
 
                 if (_cancel) { CleanUp(true); Report(DlState.Cancelled, "已取消"); return; }
 
@@ -298,16 +328,32 @@ namespace PclDl
                         ? "服务器未给出文件大小，使用单线程下载"
                         : (!_rangeSupported ? "服务器不支持分段（无 206 响应），使用单线程下载"
                                             : "文件小于 1MB，单线程直接下载"));
+                    ClearState();          // 单线程走 .part 续传，不用分块状态
                     _singleMode = true;
                     SingleThreadDownload();
                     return;
                 }
 
                 Log(string.Format("文件大小 {0}，服务器支持分段，最多 {1} 线程", FormatSize(_totalSize), MaxThreads));
+
+                if (TryLoadState())
+                {
+                    Log("发现上次没下完的分块，已恢复 " + _segs.Count + " 段，接着下…");
+                }
+                else
+                {
+                    ClearState();
+                    CreateFirstSegment();
+                }
+
                 Report(DlState.Downloading, "开始下载…");
 
-                CreateFirstSegment();
-                SpawnWorker(_segs[0]);
+                // 恢复出来可能有多段，未完成且没有线程在跑的都拉起来
+                lock (_segLock)
+                {
+                    foreach (var s in _segs)
+                        if (s.Remaining > 0 && !s.Alive) SpawnWorker(s);
+                }
                 Supervisor();
             }
             catch (Exception ex)
@@ -332,8 +378,9 @@ namespace PclDl
                 {
                     foreach (var s in _segs)
                     {
-                        if (Interlocked.Read(ref s.Done) < s.End - s.Start + 1)
-                            SpawnWorker(s);
+                        if (s.Remaining <= 0) continue;
+                        if (s.Alive) continue;   // 上一轮没收干净的线程还在跑，绝不能再开一条写同一个文件
+                        SpawnWorker(s);
                     }
                 }
                 Supervisor();
@@ -432,13 +479,9 @@ namespace PclDl
             string cd = resp.ContentDisposition;
             if (!string.IsNullOrEmpty(cd))
             {
-                string n = cd;
-                if (!string.IsNullOrEmpty(n))
-                {
-                    n = n.Trim('"');
-                    n = Path.GetFileName(n.Replace("\\", "/"));
-                    if (n.Length > 0) return Sanitize(n);
-                }
+                string n = cd.Trim('"');
+                n = Path.GetFileName(n.Replace("\\", "/"));
+                if (n.Length > 0) return Sanitize(n);
             }
             try
             {
@@ -475,12 +518,16 @@ namespace PclDl
                 Start = 0,
                 End = _totalSize - 1,
                 Index = 1,
-                TempPath = TempPathFor(1)
+                TempPath = TempPathFor(1),
+                Url = _baseUrl,
+                SourceIndex = 0
             };
-            Directory.CreateDirectory(Path.GetDirectoryName(SavePath) ?? ".");
-            Directory.CreateDirectory(TempDir());
+            string dir = Path.GetDirectoryName(SavePath);
+            if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
+            Directory.CreateDirectory(Path.GetDirectoryName(s.TempPath));
             File.WriteAllBytes(s.TempPath, new byte[0]);
             lock (_segLock) { _segs.Add(s); }
+            SaveState();
         }
 
         private static string TempDir()
@@ -488,11 +535,118 @@ namespace PclDl
             return Path.Combine(Path.GetTempPath(), "PclDlCache");
         }
 
+        /// <summary>同一保存路径的临时文件名字固定，重启后才能接着下</summary>
+        private string OwnTempDir()
+        {
+            string full = SavePath ?? "";
+            try { full = Path.GetFullPath(full); } catch { }
+            using (var md5 = MD5.Create())
+            {
+                byte[] h = md5.ComputeHash(Encoding.UTF8.GetBytes(full.ToLowerInvariant()));
+                var sb = new StringBuilder(16);
+                for (int i = 0; i < 8; i++) sb.Append(h[i].ToString("x2"));
+                return Path.Combine(TempDir(), sb.ToString());
+            }
+        }
+
         private string TempPathFor(int idx)
         {
-            string baseName = Path.GetFileName(SavePath ?? "download.bin");
-            string tag = Guid.NewGuid().ToString("N").Substring(0, 8);
-            return Path.Combine(TempDir(), string.Format("{0}.{1}.{2}.part", baseName, idx, tag));
+            return Path.Combine(OwnTempDir(), idx + ".part");
+        }
+
+        // ---------- 断点状态：分块进度落盘，重启 / 取消后能接着下 ----------
+
+        private string StatePath { get { return (SavePath ?? "") + ".pdlstate"; } }
+
+        private void SaveState()
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(SavePath)) return;
+                var sb = new StringBuilder();
+                List<Segment> segs;
+                lock (_segLock) { segs = new List<Segment>(_segs); }
+                sb.Append("PDL1\t").Append(_totalSize).Append('\t').Append(_rangeSupported ? 1 : 0)
+                  .Append('\t').Append(_baseUrl ?? Url).Append("\r\n");
+                foreach (var s in segs)
+                {
+                    sb.Append(s.Start).Append('\t')
+                      .Append(Interlocked.Read(ref s.End)).Append('\t')
+                      .Append(Interlocked.Read(ref s.Done)).Append('\t')
+                      .Append(s.Url ?? _baseUrl).Append('\t')
+                      .Append(s.TempPath).Append("\r\n");
+                }
+                string statePath = StatePath;
+                string dir = Path.GetDirectoryName(statePath);
+                if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
+                string tmp = statePath + ".tmp";
+                File.WriteAllText(tmp, sb.ToString(), new UTF8Encoding(false));
+                if (File.Exists(statePath)) File.Delete(statePath);
+                File.Move(tmp, statePath);
+            }
+            catch { }
+        }
+
+        private void ClearState()
+        {
+            try { if (File.Exists(StatePath)) File.Delete(StatePath); } catch { }
+            try
+            {
+                string d = OwnTempDir();
+                if (Directory.Exists(d))
+                    foreach (var f in Directory.GetFiles(d)) { try { File.Delete(f); } catch { } }
+            }
+            catch { }
+        }
+
+        private bool TryLoadState()
+        {
+            try
+            {
+                if (!File.Exists(StatePath)) return false;
+                var lines = File.ReadAllLines(StatePath, Encoding.UTF8);
+                if (lines.Length < 2) return false;
+                var head = lines[0].Split('\t');
+                if (head.Length < 4 || head[0] != "PDL1") return false;
+                long total;
+                if (!long.TryParse(head[1], out total) || total != _totalSize) return false;
+
+                var list = new List<Segment>();
+                long expectStart = 0;
+                for (int i = 1; i < lines.Length; i++)
+                {
+                    var p = lines[i].Split('\t');
+                    if (p.Length < 5) return false;
+                    long st, en, dn;
+                    if (!long.TryParse(p[0], out st) || !long.TryParse(p[1], out en) || !long.TryParse(p[2], out dn)) return false;
+                    if (st != expectStart || en < st || dn < 0 || dn > en - st + 1) return false;
+                    string temp = p[4];
+                    if (!File.Exists(temp)) return false;
+                    long len = new FileInfo(temp).Length;
+                    if (len < dn) return false;
+                    if (len > dn)
+                    {
+                        // 上次写多了（写完没来得及计数），截到计数位置，避免重复字节
+                        using (var fs = new FileStream(temp, FileMode.Open, FileAccess.Write, FileShare.Read))
+                            fs.SetLength(dn);
+                    }
+                    list.Add(new Segment
+                    {
+                        Start = st, End = en, Done = dn, TempPath = temp,
+                        Index = i, Url = p[3], SourceIndex = 0
+                    });
+                    expectStart = en + 1;
+                }
+                if (list.Count == 0 || expectStart != _totalSize) return false;
+
+                lock (_segLock)
+                {
+                    _segs.Clear();
+                    _segs.AddRange(list);
+                }
+                return true;
+            }
+            catch { return false; }
         }
 
         /// <summary>
@@ -503,12 +657,11 @@ namespace PclDl
         {
             long lastSample = Now();
             long lastDone = TotalDone();
+            long lastSaveState = Now();
 
             while (true)
             {
-                bool all = AllSegmentsDone();
-
-                if (all) break;
+                if (AllSegmentsDone()) break;
 
                 if (_cancel)
                 {
@@ -531,6 +684,8 @@ namespace PclDl
                     WaitWorkers();
                     if (_cancel) { CleanUp(true); Report(DlState.Cancelled, "已取消"); return; }
                     UpdateSpeedSampling(ref lastSample, ref lastDone);
+                    _speed = 0;
+                    SaveState();
                     Report(DlState.Paused, "已暂停，可继续");
                     return;
                 }
@@ -547,7 +702,7 @@ namespace PclDl
                         lock (_segLock)
                         {
                             foreach (var s in _segs)
-                                if (Interlocked.Read(ref s.Done) < s.End - s.Start + 1)
+                                if (s.Remaining > 0 && !s.Alive)
                                     SpawnWorker(s);
                         }
                         continue;
@@ -562,6 +717,12 @@ namespace PclDl
                 }
                 UpdateSpeedSampling(ref lastSample, ref lastDone);
                 Report(DlState.Downloading, null);
+
+                if (Now() - lastSaveState >= 1000)
+                {
+                    lastSaveState = Now();
+                    SaveState();
+                }
 
                 Thread.Sleep(100);
             }
@@ -586,7 +747,7 @@ namespace PclDl
             {
                 if (_segs.Count == 0) return false;
                 foreach (var s in _segs)
-                    if (Interlocked.Read(ref s.Done) < s.End - s.Start + 1) return false;
+                    if (s.Remaining > 0) return false;
             }
             return true;
         }
@@ -598,27 +759,23 @@ namespace PclDl
             {
                 long done = TotalDone();
                 _speed = (long)((done - lastDone) * 1000.0 / Math.Max(1, now - lastTime));
-                _doneSnapshot = done;
                 lastTime = now;
                 lastDone = done;
             }
         }
 
-        private static long Now()
-        {
-            return Environment.TickCount;
-        }
-
         private bool TrySplitOne()
         {
             if (_active >= MaxThreads) return false;
+            if (_cancel || _pause) return false;
 
             Segment target = null;
+            Segment seg = null;
             lock (_segLock)
             {
                 foreach (var s in _segs)
                 {
-                    if (Interlocked.Read(ref s.Done) >= s.End - s.Start + 1) continue;
+                    if (s.Remaining <= 0) continue;
                     if (s.Remaining < PieceLimit) continue;
                     if (target == null || s.Remaining > target.Remaining) target = s;
                 }
@@ -626,18 +783,19 @@ namespace PclDl
 
                 long remaining = target.Remaining;
                 long take = Math.Max(PieceLimit, (long)Math.Round(remaining * 0.4));
-                long newStart = target.End + 1 - take;
-                if (newStart - target.Start < PieceLimit) return false; // 切完太小，不切
-
                 long oldEnd = Interlocked.Read(ref target.End);
+                long newStart = oldEnd + 1 - take;
+                if (newStart - target.Start < PieceLimit) return false; // 切完太小，不切
                 long newEnd = newStart - 1;
 
-                var seg = new Segment
+                seg = new Segment
                 {
                     Start = newStart,
                     End = oldEnd,
                     Index = _segs.Count + 1,
-                    TempPath = TempPathFor(_segs.Count + 1)
+                    TempPath = TempPathFor(_segs.Count + 1),
+                    Url = target.Url,
+                    SourceIndex = target.SourceIndex
                 };
                 File.WriteAllBytes(seg.TempPath, new byte[0]);
                 _segs.Add(seg);
@@ -645,8 +803,8 @@ namespace PclDl
                 Log(string.Format("切分新线程 #{0}：{1} ~ {2}（原线程止于 {3}）",
                     seg.Index, seg.Start, seg.End, newEnd));
                 SpawnWorker(seg);
-                return true;
             }
+            return true;
         }
 
         private void SpawnWorker(Segment seg)
@@ -655,15 +813,24 @@ namespace PclDl
             t.IsBackground = true;
             t.Name = "下载线程 #" + seg.Index;
             lock (_segLock) { _workers.Add(t); }
+            seg.Alive = true;
             Interlocked.Increment(ref _active);
             t.Start();
         }
 
+        /// <summary>等所有下载线程真正退出：暂停后立刻继续会变成两条线程写同一个分块</summary>
         private void WaitWorkers()
         {
+            long deadline = Now() + 60000;
+            while (_active > 0 && Now() < deadline)
+                Thread.Sleep(100);
+
             List<Thread> list;
             lock (_segLock) { list = new List<Thread>(_workers); }
-            foreach (var t in list) t.Join(3000);
+            foreach (var t in list)
+            {
+                try { if (t.IsAlive) t.Join(200); } catch { }
+            }
         }
 
         /// <summary>
@@ -672,9 +839,10 @@ namespace PclDl
         private void WorkerMain(Segment seg)
         {
             int attempt = 0;
+            int switchCount = 0;
             try
             {
-                while (Interlocked.Read(ref seg.Done) < seg.End - seg.Start + 1)
+                while (seg.Remaining > 0)
                 {
                     if (_pause || _cancel) return;
                     try
@@ -682,19 +850,27 @@ namespace PclDl
                         DownloadSegmentOnce(seg);
                         attempt = 0;
                     }
+                    catch (PauseSignal) { return; }
                     catch (Exception ex)
                     {
                         if (_pause || _cancel) return;
                         attempt++;
-                        if (attempt >= 2 && _mirrorTries < Mirrors.Count && TryNextMirror())
+
+                        // 只换当前分块的源，别的分块继续用自己的源，避免混源拼出坏文件
+                        if (attempt >= 2 && switchCount < Mirrors.Count)
                         {
-                            _mirrorTries++;
+                            switchCount++;
+                            seg.SourceIndex++;
+                            seg.Url = seg.SourceIndex <= Mirrors.Count
+                                ? Mirrors[seg.SourceIndex - 1]
+                                : _baseUrl;
                             attempt = 0;
-                            Log("线程 #" + seg.Index + " 切换镜像源：" + Url);
+                            Log("线程 #" + seg.Index + " 切换镜像源：" + seg.Url);
                             continue;
                         }
+
                         if (attempt > 3) throw;
-                        Log(string.Format("线程 #{0} 第 {1} 次失败：{2}，1 秒后续传", seg.Index, attempt, ex.Message));
+                        Log(string.Format("线程 #{0} 第 {1} 次失败：{2}，{3} 毫秒后续传", seg.Index, attempt, ex.Message, 1000 * attempt));
                         Thread.Sleep(1000 * attempt);
                     }
                 }
@@ -710,28 +886,66 @@ namespace PclDl
             }
             finally
             {
+                seg.Alive = false;
                 Interlocked.Decrement(ref _active);
             }
         }
 
-        private bool TryNextMirror()
+        /// <summary>读一段，边读边看暂停/取消/超时，暂停能秒级响应而不是卡 30 秒</summary>
+        private int ReadChunk(Stream stream, byte[] buf, int want)
         {
-            if (Mirrors == null || Mirrors.Count == 0) return false;
-            _srcIdx = (_srcIdx + 1) % Mirrors.Count;
-            Url = Mirrors[_srcIdx];
-            return true;
+            var task = stream.ReadAsync(buf, 0, want);
+            long start = Now();
+            while (true)
+            {
+                try
+                {
+                    if (task.Wait(100)) break;
+                }
+                catch (AggregateException ex)
+                {
+                    throw (ex.InnerException ?? ex);
+                }
+                if (_cancel) throw new OperationCanceledException("已取消");
+                if (_pause) throw new PauseSignal();
+                if (Now() - start > ReadTimeoutMs)
+                    throw new Exception("读取超时（30 秒无数据）");
+            }
+            try { return task.Result; }
+            catch (AggregateException ex) { throw (ex.InnerException ?? ex); }
         }
 
         private void DownloadSegmentOnce(Segment seg)
         {
-            long from = seg.Start + Interlocked.Read(ref seg.Done);
+            long done = Interlocked.Read(ref seg.Done);
+            long from = seg.Start + done;
             long to = Interlocked.Read(ref seg.End);
             if (from > to) return;
 
+            // 对齐临时文件长度：上次可能写完但计数没加上，直接 append 会重复字节
+            if (File.Exists(seg.TempPath))
+            {
+                long len = new FileInfo(seg.TempPath).Length;
+                if (len > done)
+                {
+                    using (var fs = new FileStream(seg.TempPath, FileMode.Open, FileAccess.Write, FileShare.Read))
+                        fs.SetLength(done);
+                }
+                else if (len < done)
+                {
+                    Interlocked.Exchange(ref seg.Done, len);
+                    done = len;
+                    from = seg.Start + done;
+                    if (from > to) return;
+                }
+            }
+            else File.WriteAllBytes(seg.TempPath, new byte[0]);
+
             FetchResult resp;
+            var srcUrl = seg.Url ?? _baseUrl;
             try
             {
-                resp = _http.Fetch(Url, from, to);
+                resp = _http.Fetch(srcUrl, from, to);
             }
             catch (Exception ex)
             {
@@ -754,31 +968,31 @@ namespace PclDl
                     throw new Exception(string.Format("文件大小与探测不一致：期望 {0}，实际 {1}", expect, gotLen));
 
                 var stream = resp.Body;
-                var fs = new FileStream(seg.TempPath, FileMode.Append, FileAccess.Write, FileShare.Read);
+                var fs = new FileStream(seg.TempPath, FileMode.OpenOrCreate, FileAccess.Write, FileShare.Read);
                 try
                 {
+                    fs.SetLength(done);
+                    fs.Position = done;
+
                     byte[] buf = new byte[BufferSize];
                     long lastRecv = Now();
-                    while (Interlocked.Read(ref seg.Done) < seg.End - seg.Start + 1)
+                    while (seg.Remaining > 0)
                     {
-                        if (_pause || _cancel) return;
+                        if (_cancel) throw new OperationCanceledException("已取消");
+                        if (_pause) throw new PauseSignal();
 
-                        long remaining = seg.End - seg.Start + 1 - Interlocked.Read(ref seg.Done);
-                        int want = (int)Math.Min(BufferSize, remaining);
+                        long room = seg.Remaining;
+                        int want = (int)Math.Min(BufferSize, room);
                         if (want <= 0) break;
 
-                        var readTask = stream.ReadAsync(buf, 0, want);
-                        if (!readTask.Wait(30000))
-                            throw new Exception("读取超时（30 秒无数据）");
-                        int n = readTask.Result;
+                        int n = ReadChunk(stream, buf, want);
                         if (n <= 0) break;
 
-                        long room = seg.End - seg.Start + 1 - Interlocked.Read(ref seg.Done);
-                        if (room <= 0) break;
-                        if (n > room) n = (int)room;
+                        long room2 = seg.Remaining;
+                        if (room2 <= 0) break;
+                        if (n > room2) n = (int)room2;
 
                         fs.Write(buf, 0, n);
-                        fs.Flush();
                         Interlocked.Add(ref seg.Done, n);
                         SpeedLimiter.Global.Take(n);
 
@@ -786,6 +1000,7 @@ namespace PclDl
                         if (gap > 5000 && n < gap) throw new Exception("速度过慢，主动断开重连");
                         lastRecv = Now();
                     }
+                    fs.Flush();
                 }
                 finally
                 {
@@ -798,7 +1013,8 @@ namespace PclDl
         // ================= 单线程兜底 =================
         private void SingleThreadDownload()
         {
-            Directory.CreateDirectory(Path.GetDirectoryName(SavePath) ?? ".");
+            string dir = Path.GetDirectoryName(SavePath);
+            if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
             string part = SavePath + ".part";
             long done = 0;
             if (File.Exists(part)) done = new FileInfo(part).Length;
@@ -828,6 +1044,12 @@ namespace PclDl
                     if (_unknownSize && resp.ContentLength > 0)
                         _totalSize = (_rangeSupported && done > 0) ? done + resp.ContentLength : resp.ContentLength;
 
+                    if (done > 0 && File.Exists(part) && new FileInfo(part).Length > done)
+                    {
+                        using (var trim = new FileStream(part, FileMode.Open, FileAccess.Write, FileShare.Read))
+                            trim.SetLength(done);
+                    }
+
                     var stream = resp.Body;
                     var fs = new FileStream(part, done > 0 ? FileMode.Append : FileMode.Create, FileAccess.Write, FileShare.Read);
                     try
@@ -836,13 +1058,13 @@ namespace PclDl
                         long lastSample = Now(), lastDone = done;
                         while (true)
                         {
-                            if (_pause || _cancel) return;
-                            var rt = stream.ReadAsync(buf, 0, BufferSize);
-                            if (!rt.Wait(30000)) throw new Exception("读取超时（30 秒无数据）");
-                            int n = rt.Result;
+                            if (_cancel) { break; }
+                            // 暂停要正常收尾：报 Paused 出去，界面才能再点继续
+                            if (_pause) break;
+
+                            int n = ReadChunk(stream, buf, BufferSize);
                             if (n <= 0) break;
                             fs.Write(buf, 0, n);
-                            fs.Flush();
                             done += n;
                             Interlocked.Exchange(ref _singleDone, done);
                             SpeedLimiter.Global.Take(n);
@@ -856,18 +1078,21 @@ namespace PclDl
                             }
                             if (!_unknownSize && done >= _totalSize) break;
                         }
+                        fs.Flush();
                     }
                     finally { fs.Dispose(); stream.Dispose(); }
                 }
 
+                if (_cancel) { CleanUp(true); Report(DlState.Cancelled, "已取消"); return; }
+                if (_pause) break;
                 if (!_unknownSize && done >= _totalSize) break;
-                if (_pause || _cancel) break;
                 if (!_rangeSupported) break;
             }
 
             if (_pause)
             {
-                Report(DlState.Paused, "已暂停（下次将继续）");
+                _speed = 0;
+                Report(DlState.Paused, "已暂停（点继续会接着下）");
                 return;
             }
 
@@ -893,12 +1118,22 @@ namespace PclDl
             lock (_segLock) { ordered.AddRange(_segs); }
             ordered.Sort((a, b) => a.Start.CompareTo(b.Start));
 
+            // 覆盖检查：分段必须从 0 连续到末尾，缺一段就是状态坏了，不能拼出坏文件
+            long cover = 0;
+            foreach (var s in ordered)
+            {
+                if (s.Start != cover) throw new Exception("分块区间不连续（" + s.Start + " 应为 " + cover + "）");
+                cover = Interlocked.Read(ref s.End) + 1;
+            }
+            if (_totalSize > 0 && cover != _totalSize)
+                throw new Exception(string.Format("分块覆盖长度不对：{0} 应为 {1}", cover, _totalSize));
+
             string tmpOut = SavePath + ".merging";
             using (var outFs = new FileStream(tmpOut, FileMode.Create, FileAccess.Write))
             {
                 foreach (var seg in ordered)
                 {
-                    long need = seg.End - seg.Start + 1;
+                    long need = seg.Length;
                     using (var inFs = new FileStream(seg.TempPath, FileMode.Open, FileAccess.Read, FileShare.Read))
                     {
                         byte[] buf = new byte[65536];
@@ -928,6 +1163,13 @@ namespace PclDl
             {
                 try { if (File.Exists(seg.TempPath)) File.Delete(seg.TempPath); } catch { }
             }
+            try { if (File.Exists(StatePath)) File.Delete(StatePath); } catch { }
+            try
+            {
+                string own = OwnTempDir();
+                if (Directory.Exists(own)) Directory.Delete(own, true);
+            }
+            catch { }
         }
 
         private void VerifyFinished()
@@ -940,7 +1182,7 @@ namespace PclDl
                 using (var fs = new FileStream(SavePath, FileMode.Open, FileAccess.Read, FileShare.Read))
                 {
                     var hash = sha.ComputeHash(fs);
-                    var sb = new System.Text.StringBuilder(hash.Length * 2);
+                    var sb = new StringBuilder(hash.Length * 2);
                     foreach (var b in hash) sb.Append(b.ToString("x2"));
                     ActualSha256 = sb.ToString();
                 }
@@ -968,6 +1210,7 @@ namespace PclDl
             string merging = SavePath + ".merging";
             try { if (deleteAll && File.Exists(part)) File.Delete(part); } catch { }
             try { if (deleteAll && File.Exists(merging)) File.Delete(merging); } catch { }
+            if (!deleteAll) return;
             lock (_segLock)
             {
                 foreach (var s in _segs)
@@ -976,6 +1219,13 @@ namespace PclDl
                 }
                 _segs.Clear();
             }
+            try { if (File.Exists(StatePath)) File.Delete(StatePath); } catch { }
+            try
+            {
+                string own = OwnTempDir();
+                if (Directory.Exists(own)) Directory.Delete(own, true);
+            }
+            catch { }
         }
     }
 }

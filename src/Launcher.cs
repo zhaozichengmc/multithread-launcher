@@ -406,8 +406,9 @@ namespace PclDlGui
 
             if (v["minecraftArguments"] != null)
             {
-                foreach (var a in ((string)v["minecraftArguments"]).Split(' '))
-                    if (!string.IsNullOrEmpty(a)) args.Add(Fill(a, map));
+                // 不能按空格硬切：昵称/路径带空格、或参数是空串 "" 时会整体错位
+                foreach (var a in SplitArgs((string)v["minecraftArguments"]))
+                    args.Add(Fill(a, map));
             }
             else
             {
@@ -434,6 +435,37 @@ namespace PclDlGui
             return psi;
         }
 
+        /// <summary>按 Windows 规则切分参数串：支持双引号、引号内空格、\" 转义和空参数</summary>
+        private static List<string> SplitArgs(string s)
+        {
+            var list = new List<string>();
+            if (string.IsNullOrEmpty(s)) return list;
+
+            var sb = new StringBuilder();
+            bool inQuote = false, hasToken = false;
+            for (int i = 0; i < s.Length; i++)
+            {
+                char c = s[i];
+                if (c == '\\' && i + 1 < s.Length && s[i + 1] == '"')
+                {
+                    sb.Append('"'); i++; hasToken = true; continue;
+                }
+                if (c == '"')
+                {
+                    inQuote = !inQuote; hasToken = true; continue;
+                }
+                if (!inQuote && (c == ' ' || c == '\t'))
+                {
+                    if (hasToken) { list.Add(sb.ToString()); sb.Length = 0; hasToken = false; }
+                    continue;
+                }
+                sb.Append(c);
+                hasToken = true;
+            }
+            if (hasToken) list.Add(sb.ToString());
+            return list;
+        }
+
         private static List<string> QuoteAll(List<string> args)
         {
             var l = new List<string>();
@@ -441,11 +473,39 @@ namespace PclDlGui
             return l;
         }
 
+        /// <summary>
+        /// 按 CreateProcess / CommandLineToArgvW 的规则加引号：以前用 \" 转义是错的，
+        /// 参数里带引号或结尾反斜杠时 JVM 会收到错位的字符串。
+        /// </summary>
         private static string Quote(string s)
         {
             if (string.IsNullOrEmpty(s)) return "\"\"";
-            if (s.IndexOfAny(new[] { ' ', '\t', '"' }) < 0) return s;
-            return "\"" + s.Replace("\"", "\\\"") + "\"";
+            bool need = false;
+            foreach (char c in s)
+                if (c == ' ' || c == '\t' || c == '"') { need = true; break; }
+            if (!need) return s;
+
+            var sb = new StringBuilder(s.Length + 4);
+            sb.Append('"');
+            int backslashes = 0;
+            foreach (char c in s)
+            {
+                if (c == '\\') { backslashes++; continue; }
+                if (c == '"')
+                {
+                    sb.Append('\\', backslashes * 2 + 1);
+                    sb.Append('"');
+                    backslashes = 0;
+                }
+                else
+                {
+                    if (backslashes > 0) { sb.Append('\\', backslashes); backslashes = 0; }
+                    sb.Append(c);
+                }
+            }
+            if (backslashes > 0) sb.Append('\\', backslashes * 2);
+            sb.Append('"');
+            return sb.ToString();
         }
     }
 }

@@ -31,7 +31,7 @@ namespace PclDlGui
     /// </summary>
     public static class UpdateChecker
     {
-        public const string CurrentVersion = "2.1";
+        public const string CurrentVersion = "2.2";
         public const string Owner = "zhaozichengmc";
         public const string Repo = "multithread-launcher";
         public const string ReleasesPage = "https://github.com/" + Owner + "/" + Repo + "/releases";
@@ -148,7 +148,7 @@ namespace PclDlGui
             return list;
         }
 
-        /// <summary>下载更新包到临时目录，返回本地文件路径</summary>
+        /// <summary>下载更新包到临时目录，返回本地文件路径（带超时，并校验真的是 exe）</summary>
         public static string DownloadExe(ReleaseInfo info, Action<int> progress)
         {
             string dir = Path.Combine(Path.GetTempPath(), "LightspeedUpdate");
@@ -160,21 +160,73 @@ namespace PclDlGui
             foreach (var url in tries)
             {
                 if (string.IsNullOrEmpty(url)) continue;
+                string tmp = dest + ".download";
                 try
                 {
-                    using (var wc = new WebClient())
-                    {
-                        wc.Headers.Add("User-Agent", "LightspeedDownloader/" + CurrentVersion);
-                        if (progress != null)
-                            wc.DownloadProgressChanged += (s, e) => { try { progress(e.ProgressPercentage); } catch { } };
-                        wc.DownloadFile(url, dest);
-                    }
-                    if (new FileInfo(dest).Length > 0) return dest;
+                    DownloadTo(url, tmp, info.ExeSize, progress);
+                    ValidateExe(tmp, info.ExeSize);
+                    if (File.Exists(dest)) File.Delete(dest);
+                    File.Move(tmp, dest);
+                    return dest;
                 }
-                catch (Exception e) { last = e; }
+                catch (Exception e)
+                {
+                    last = e;
+                    try { if (File.Exists(tmp)) File.Delete(tmp); } catch { }
+                }
             }
-            if (last != null) throw last;
-            return null;
+            throw last ?? new Exception("没有可用的下载地址");
+        }
+
+        /// <summary>带超时的下载：代理挂起或返回错误页时不会永远卡在“正在下载”</summary>
+        private static void DownloadTo(string url, string path, long expectSize, Action<int> progress)
+        {
+            var req = (HttpWebRequest)WebRequest.Create(url);
+            req.UserAgent = "LightspeedDownloader/" + CurrentVersion;
+            req.Timeout = 15000;
+            req.ReadWriteTimeout = 20000;
+            req.AllowAutoRedirect = true;
+
+            using (var resp = (HttpWebResponse)req.GetResponse())
+            {
+                long total = resp.ContentLength;
+                if (expectSize > 0) total = expectSize;
+                using (var s = resp.GetResponseStream())
+                using (var fs = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.None))
+                {
+                    byte[] buf = new byte[8192];
+                    long got = 0;
+                    int lastPct = -1;
+                    while (true)
+                    {
+                        int n = s.Read(buf, 0, buf.Length);
+                        if (n <= 0) break;
+                        fs.Write(buf, 0, n);
+                        got += n;
+                        if (progress != null && total > 0)
+                        {
+                            int pct = (int)Math.Min(99, got * 100 / total);
+                            if (pct != lastPct) { lastPct = pct; progress(pct); }
+                        }
+                    }
+                }
+            }
+        }
+
+        /// <summary>防止把 429 的 JSON / 代理 HTML 错误页当成更新包覆盖掉自己</summary>
+        private static void ValidateExe(string path, long expectSize)
+        {
+            var fi = new FileInfo(path);
+            if (fi.Length < 100000)
+                throw new Exception("下载到的不是程序文件（只有 " + fi.Length + " 字节，可能是代理返回的错误页）");
+            if (expectSize > 0 && fi.Length != expectSize)
+                throw new Exception("大小不符：期望 " + expectSize + "，实际 " + fi.Length);
+            using (var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read))
+            {
+                byte[] head = new byte[2];
+                if (fs.Read(head, 0, 2) != 2 || head[0] != (byte)'M' || head[1] != (byte)'Z')
+                    throw new Exception("下载到的不是有效的 exe（文件头不对）");
+            }
         }
 
         /// <summary>
@@ -188,16 +240,18 @@ namespace PclDlGui
 
             string script =
                 "@echo off\r\n" +
+                "setlocal enabledelayedexpansion\r\n" +
                 "chcp 65001 >nul\r\n" +
-                "timeout /t 3 /nobreak >nul\r\n" +
+                "timeout /t 2 /nobreak >nul\r\n" +
                 "set /a n=0\r\n" +
                 ":retry\r\n" +
                 "set /a n+=1\r\n" +
                 "copy /y \"" + newExePath + "\" \"" + self + "\" >nul 2>nul\r\n" +
                 "if errorlevel 1 (\r\n" +
-                "  if %n% lss 12 ( timeout /t 2 /nobreak >nul & goto retry )\r\n" +
+                "  if !n! lss 60 ( timeout /t 1 /nobreak >nul & goto retry )\r\n" +
                 ")\r\n" +
                 "start \"\" \"" + self + "\"\r\n" +
+                "timeout /t 1 /nobreak >nul\r\n" +
                 "del /f /q \"" + bat + "\"\r\n";
 
             File.WriteAllText(bat, script, new UTF8Encoding(true));
@@ -225,6 +279,22 @@ namespace PclDlGui
         private RoundButton _btnDownload, _btnPage, _btnLater;
         private string _downloaded;
         private bool _ready;
+
+        /// <summary>窗口关了以后后台线程还会回调，直接 BeginInvoke 会抛异常把整个程序带走</summary>
+        private void Ui(Action a)
+        {
+            if (a == null) return;
+            try
+            {
+                if (IsDisposed || Disposing) return;
+                if (InvokeRequired)
+                {
+                    if (IsHandleCreated) BeginInvoke(a);
+                }
+                else a();
+            }
+            catch { }
+        }
 
         private void DoRestart()
         {
@@ -314,27 +384,28 @@ namespace PclDlGui
             {
                 try
                 {
-                    _downloaded = UpdateChecker.DownloadExe(_info, p => BeginInvoke((Action)(() =>
+                    _downloaded = UpdateChecker.DownloadExe(_info, p => Ui(() =>
                     {
+                        if (_bar == null) return;
                         _bar.Value = Math.Min(100, Math.Max(0, p));
                         _labStatus.Text = "正在下载更新包… " + p + "%";
-                    })));
-                    BeginInvoke((Action)(() =>
+                    }));
+                    Ui(() =>
                     {
                         _bar.Value = 100;
                         _labStatus.Text = "下载完成，点「立即重启」完成替换";
                         _btnDownload.Text = "立即重启";
                         _btnDownload.Enabled = true;
                         _ready = true;
-                    }));
+                    });
                 }
                 catch (Exception ex)
                 {
-                    BeginInvoke((Action)(() =>
+                    Ui(() =>
                     {
                         _btnDownload.Enabled = true;
                         _labStatus.Text = "下载失败：" + ex.Message + "（可打开发布页手动下载）";
-                    }));
+                    });
                 }
             });
             th.IsBackground = true;

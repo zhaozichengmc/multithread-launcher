@@ -53,7 +53,10 @@ namespace PclDlGui
                     {
                         case "proxy": s.ProxyEnabled = v == "1"; break;
                         case "proxyhost": s.ProxyHost = v; break;
-                        case "proxyport": s.ProxyPort = int.Parse(v); break;
+                        case "proxyport":
+                            int pp = 0;
+                            if (int.TryParse(v, out pp) && pp > 0 && pp < 65536) s.ProxyPort = pp;
+                            break;
                         case "socks5": s.Socks5 = v == "1"; break;
                         case "proxyuser": s.ProxyUser = v; break;
                         case "proxypass": s.ProxyPass = v; break;

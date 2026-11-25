@@ -4,6 +4,7 @@ using System.Drawing;
 using System.IO;
 using System.IO.Compression;
 using System.Net;
+using System.Security.Cryptography;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
@@ -179,19 +180,45 @@ namespace PclDlGui
             b.TextColor = Color.White;
         }
 
+        /// <summary>关窗后后台线程还会回调，直接 BeginInvoke 会抛异常把整个程序带走</summary>
+        private void Ui(Action a)
+        {
+            if (a == null || IsDisposed || Disposing) return;
+            try
+            {
+                if (InvokeRequired) { if (IsHandleCreated) BeginInvoke(a); }
+                else a();
+            }
+            catch { }
+        }
+
         private void Log(string s)
         {
-            if (InvokeRequired) { BeginInvoke((Action)(() => Log(s))); return; }
-            txtLog.AppendText(DateTime.Now.ToString("HH:mm:ss") + "  " + s + Environment.NewLine);
-            txtLog.SelectionStart = txtLog.TextLength;
-            txtLog.ScrollToCaret();
+            if (IsDisposed || Disposing) return;
+            Ui(() =>
+            {
+                try
+                {
+                    txtLog.AppendText(DateTime.Now.ToString("HH:mm:ss") + "  " + s + Environment.NewLine);
+                    txtLog.SelectionStart = txtLog.TextLength;
+                    txtLog.ScrollToCaret();
+                }
+                catch { }
+            });
         }
 
         private void SetStatus(string s, int perMille = -1)
         {
-            if (InvokeRequired) { BeginInvoke((Action)(() => SetStatus(s, perMille))); return; }
-            labStatus.Text = s;
-            if (perMille >= 0) bar.Value = Math.Max(0, Math.Min(1000, perMille));
+            if (IsDisposed || Disposing) return;
+            Ui(() =>
+            {
+                try
+                {
+                    labStatus.Text = s;
+                    if (perMille >= 0) bar.Value = Math.Max(0, Math.Min(1000, perMille));
+                }
+                catch { }
+            });
         }
 
         private void BrowseDir()
@@ -237,21 +264,22 @@ namespace PclDlGui
                             Url = (string)t["url"],
                             Time = ((string)t["releaseTime"] ?? "").Replace('T', ' ').Replace("+00:00", "")
                         });
-                    BeginInvoke((Action)(() =>
+                    Ui(() =>
                     {
+                        if (IsDisposed || Disposing) return;
                         _versions = list;
                         FillList();
                         SetStatus("清单已加载：" + list.Count + " 个版本", 0);
                         btnStart.Enabled = lv.SelectedItems.Count > 0;
-                    }));
+                    });
                 }
                 catch (Exception ex)
                 {
-                    BeginInvoke((Action)(() =>
+                    Ui(() =>
                     {
                         SetStatus("读取清单失败：" + ex.Message, 0);
                         Log("读取清单失败：" + ex.Message + "（可点“刷新清单”重试）");
-                    }));
+                    });
                 }
             });
             _worker.IsBackground = true;
@@ -310,31 +338,35 @@ namespace PclDlGui
                 try
                 {
                     _installer.Run();
-                    BeginInvoke((Action)(() =>
+                    Ui(() =>
                     {
+                        if (IsDisposed || Disposing) return;
                         SetStatus("完成：" + v.Id + " 已下载到 " + dir, 1000);
                         Log("完成。用 PCL2 / HMCL 选择该目录即可启动。");
-                    }));
+                    });
                 }
                 catch (Exception ex)
                 {
-                    BeginInvoke((Action)(() =>
+                    Ui(() =>
                     {
+                        if (IsDisposed || Disposing) return;
                         SetStatus("失败：" + ex.Message, 0);
                         Log("失败：" + ex.Message);
-                    }));
+                    });
                 }
                 finally
                 {
-                    BeginInvoke((Action)(() =>
+                    // 关窗后 IsHandleCreated 为 false，这里一定不能再硬 BeginInvoke（以前就是闪退点）
+                    Ui(() =>
                     {
+                        if (IsDisposed || Disposing) return;
                         _busy = false;
-                        btnStart.Enabled = lv.SelectedItems.Count > 0;
-                        btnCancel.Enabled = false;
-                        btnRefresh.Enabled = true;
-                        btnStart.Text = "下载此版本";
+                        if (btnStart != null) btnStart.Enabled = lv.SelectedItems.Count > 0;
+                        if (btnCancel != null) btnCancel.Enabled = false;
+                        if (btnRefresh != null) btnRefresh.Enabled = true;
+                        if (btnStart != null) btnStart.Text = "下载此版本";
                         if (_closeAfter) Close();
-                    }));
+                    });
                 }
             });
             _instThread.IsBackground = true;
@@ -674,6 +706,7 @@ namespace PclDlGui
                             Fallback = "https://resources.download.minecraft.net/" + hash.Substring(0, 2) + "/" + hash,
                             Path = Path.Combine(assetsDir, "objects", hash.Substring(0, 2), hash),
                             Size = size,
+                            Sha1 = hash,
                             Name = kv.Key,
                             LegacyDir = legacyTarget
                         });
@@ -700,11 +733,11 @@ namespace PclDlGui
                         {
                             if (!Cancel)
                             {
-                                DownloadSmall(file.Url, file.Fallback, file.Path, file.Size, true);
+                                DownloadSmall(file.Url, file.Fallback, file.Path, file.Size, true, file.Sha1);
                                 if (!string.IsNullOrEmpty(file.LegacyDir))
                                 {
                                     string dst = Path.Combine(file.LegacyDir, file.Name.Replace('/', Path.DirectorySeparatorChar));
-                                    if (!File.Exists(dst) || (file.Size > 0 && new FileInfo(dst).Length != file.Size))
+                                    if (!File.Exists(dst) || new FileInfo(dst).Length != file.Size || Sha1Of(dst) != file.Sha1)
                                     {
                                         Directory.CreateDirectory(Path.GetDirectoryName(dst));
                                         File.Copy(file.Path, dst, true);
@@ -752,7 +785,7 @@ namespace PclDlGui
         private static long L(JToken t) { return t == null ? -1 : (long)t; }
 
         private class LibFile { public string Url, Fallback, Path; public long Size; public bool IsNative; }
-        private class AssetFile { public string Url, Fallback, Path, Name, LegacyDir; public long Size; }
+        private class AssetFile { public string Url, Fallback, Path, Name, LegacyDir, Sha1; public long Size; }
 
         private static bool Allowed(JToken lib)
         {
@@ -832,11 +865,17 @@ namespace PclDlGui
             throw last ?? new Exception("下载失败：" + url);
         }
 
-        /// <summary>小文件直连下载（资源、索引），大小一致就跳过</summary>
-        private bool DownloadSmall(string url, string fallback, string path, long size, bool quiet = false)
+        /// <summary>小文件直连下载（资源、索引），大小一致就跳过；给了 sha1 还要校验哈希</summary>
+        private bool DownloadSmall(string url, string fallback, string path, long size, bool quiet = false, string sha1 = null)
         {
             CheckCancel();
-            if (File.Exists(path) && (size <= 0 || new FileInfo(path).Length == size)) return true;
+            if (File.Exists(path))
+            {
+                bool ok = size <= 0 || new FileInfo(path).Length == size;
+                if (ok && !string.IsNullOrEmpty(sha1)) ok = Sha1Of(path) == sha1.ToLowerInvariant();
+                if (ok) return true;
+                try { File.Delete(path); } catch { }
+            }
             Directory.CreateDirectory(Path.GetDirectoryName(path));
 
             Exception last = null;
@@ -855,6 +894,9 @@ namespace PclDlGui
                     }
                     long len = new FileInfo(tmp).Length;
                     if (size > 0 && len != size) throw new Exception("大小不符（期望 " + size + "，实际 " + len + "）");
+                    // assets 按 SHA-1 命名，只比大小会放过内容错的镜像响应
+                    if (!string.IsNullOrEmpty(sha1) && Sha1Of(tmp) != sha1.ToLowerInvariant())
+                        throw new Exception("哈希不符（期望 " + sha1.Substring(0, 8) + "…）");
                     if (File.Exists(path)) File.Delete(path);
                     File.Move(tmp, path);
                     return true;
@@ -868,6 +910,22 @@ namespace PclDlGui
                 }
             }
             throw last ?? new Exception("下载失败：" + url);
+        }
+
+        internal static string Sha1Of(string path)
+        {
+            try
+            {
+                using (var sha = SHA1.Create())
+                using (var fs = File.OpenRead(path))
+                {
+                    byte[] hash = sha.ComputeHash(fs);
+                    var sb = new StringBuilder(hash.Length);
+                    foreach (byte b in hash) sb.Append(b.ToString("x2"));
+                    return sb.ToString();
+                }
+            }
+            catch { return ""; }
         }
 
         private static void ExtractNatives(string zipPath, string targetDir)

@@ -30,6 +30,7 @@ namespace PclDlGui
         private bool _afterDone = true;
         private string _lastClip;
         private readonly Dictionary<int, Icon> _icons = new Dictionary<int, Icon>();
+        private readonly Dictionary<int, IntPtr> _iconHandles = new Dictionary<int, IntPtr>();
         private float _zoom = 1f;
         private BrowserForm _browser;
         private McForm _mcForm;
@@ -362,7 +363,9 @@ namespace PclDlGui
                         g.DrawLine(pen, 21, 15, 16, 20);
                     }
                 }
-                var icon = Icon.FromHandle(bmp.GetHicon());
+                IntPtr h = bmp.GetHicon();
+                var icon = Icon.FromHandle(h);
+                _iconHandles[percent] = h;   // 记下 HICON，退出时 DestroyIcon，否则 GDI 句柄一直涨
                 _icons[percent] = icon;
                 return icon;
             }
@@ -375,6 +378,11 @@ namespace PclDlGui
                 try { ic.Dispose(); } catch { }
             }
             _icons.Clear();
+            foreach (var h in _iconHandles.Values)
+            {
+                try { DestroyIcon(h); } catch { }
+            }
+            _iconHandles.Clear();
         }
 
         [DllImport("user32.dll")]
@@ -613,12 +621,13 @@ namespace PclDlGui
         private void CheckAllDone()
         {
             if (_active > 0 || _afterDone) return;
-            bool anyPending = false, anyFinished = false;
+            bool anyPending = false, anyFinished = false, anyFailed = false;
             foreach (var t in _tasks)
             {
                 if (t.Running || t.State == DlState.Idle || t.State == DlState.Probing || t.State == DlState.Downloading)
                     anyPending = true;
                 if (t.State == DlState.Finished) anyFinished = true;
+                if (t.State == DlState.Failed || t.State == DlState.Cancelled) anyFailed = true;
             }
             if (anyPending) return;
 
@@ -627,11 +636,19 @@ namespace PclDlGui
             Log("全部任务结束");
 
             if (!anyFinished) return;
+
             switch (cboAfter.SelectedIndex)
             {
                 case 1: OpenDir(); break;
-                case 2: Run("rundll32.exe", "powrprof.dll,SetSuspendState 0,1,0"); break;
-                case 3: Run("shutdown.exe", "/s /t 60"); Log("60 秒后关机，可执行 shutdown /a 取消"); break;
+                case 2:
+                    if (anyFailed) { Log("有任务失败或取消，已跳过自动休眠"); break; }
+                    Run("rundll32.exe", "powrprof.dll,SetSuspendState 0,1,0");
+                    break;
+                case 3:
+                    if (anyFailed) { Log("有任务失败或取消，已跳过自动关机（避免白跑一晚）"); break; }
+                    Run("shutdown.exe", "/s /t 60");
+                    Log("60 秒后关机，可执行 shutdown /a 取消");
+                    break;
             }
         }
 
@@ -983,8 +1000,13 @@ namespace PclDlGui
 
         private void Log(string msg)
         {
-            if (IsDisposed) return;
-            txtLog.AppendText(DateTime.Now.ToString("HH:mm:ss") + "  " + msg + Environment.NewLine);
+            if (IsDisposed || Disposing) return;
+            try
+            {
+                if (InvokeRequired) { Ui(() => Log(msg)); return; }
+                txtLog.AppendText(DateTime.Now.ToString("HH:mm:ss") + "  " + msg + Environment.NewLine);
+            }
+            catch { }
         }
 
         private void Ui(Action a)
@@ -1007,7 +1029,7 @@ namespace PclDlGui
             {
                 var lines = new List<string>();
                 foreach (var t in _tasks)
-                    lines.Add(t.Url + "\t" + t.Path + "\t" + t.Threads + "\t" + (t.Sha256 ?? "") + "\t" + (t.Referer ?? ""));
+                    lines.Add(t.Url + "\t" + t.Path + "\t" + t.Threads + "\t" + (t.Sha256 ?? "") + "\t" + (t.Referer ?? "") + "\t" + t.State);
                 AppSettings.SaveLines(QueueFile, lines);
             }
             catch (Exception ex) { Log("队列保存失败：" + ex.Message); }
@@ -1026,10 +1048,25 @@ namespace PclDlGui
                     if (p.Length > 2) int.TryParse(p[2], out th);
                     if (th < 1 || th > 256) th = 16;
                     AddTaskItem(p[0], p[1], th);
-                    if (p.Length > 3 && p[3].Length == 64) _tasks[_tasks.Count - 1].Sha256 = p[3];
-                    if (p.Length > 4 && p[4].Length > 0) _tasks[_tasks.Count - 1].Referer = p[4];
+                    var item = _tasks[_tasks.Count - 1];
+                    if (p.Length > 3 && p[3].Length == 64) item.Sha256 = p[3];
+                    if (p.Length > 4 && p[4].Length > 0) item.Referer = p[4];
+
+                    // 只恢复"已完成"：以前一律按 Idle 恢复，再点开始全部会把下好的文件删掉重下
+                    if (p.Length > 5 && p[5] == DlState.Finished.ToString() && File.Exists(item.Path))
+                    {
+                        item.State = DlState.Finished;
+                        try
+                        {
+                            item.Done = new FileInfo(item.Path).Length;
+                            item.Total = item.Done;
+                        }
+                        catch { }
+                        if (item.Done > 0) item.Row.SubItems[2].Text = "100%";
+                    }
+                    UpdateRow(item);
                 }
-                Log("已恢复上次的 " + _tasks.Count + " 个任务（未下完的会重新开始）");
+                Log("已恢复上次的 " + _tasks.Count + " 个任务（没下完的会从头开始）");
             }
             catch { }
             UpdateSummary();
