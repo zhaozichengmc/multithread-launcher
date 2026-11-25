@@ -23,6 +23,7 @@ namespace PclDlGui
         private Label _labStatus;
         private Button _btnSystem;
         private bool _ready;
+        private string _pendingUrl;
 
         public BrowserForm(Action<string, string, string> onDownload)
         {
@@ -71,7 +72,23 @@ namespace PclDlGui
             btnFwd.Click += (s, e) => { try { if (_web.CoreWebView2.CanGoForward) _web.CoreWebView2.GoForward(); } catch { } };
             btnReload.Click += (s, e) => { try { _web.CoreWebView2.Reload(); } catch { } };
             btnGo.Click += (s, e) => Navigate();
-            _txtAddr.KeyDown += (s, e) => { if (e.KeyCode == Keys.Enter) { e.SuppressKeyPress = true; Navigate(); } };
+            _txtAddr.KeyDown += (s, e) =>
+            {
+                if (e.KeyCode == Keys.Enter)
+                {
+                    e.SuppressKeyPress = true;
+                    e.Handled = true;
+                    Navigate();
+                }
+            };
+            _txtAddr.KeyPress += (s, e) =>
+            {
+                if (e.KeyChar == (char)Keys.Return)
+                {
+                    e.Handled = true;
+                    Navigate();
+                }
+            };
             btnGrab.Click += (s, e) => GrabCurrent();
             _btnSystem.Click += (s, e) => OpenExternal(CurrentUrl());
 
@@ -109,12 +126,21 @@ namespace PclDlGui
 
                 _ready = true;
                 _labStatus.Text = "就绪：网页里的下载会自动进队列";
-                TryNavigate("https://www.bing.com/");
+                if (!string.IsNullOrEmpty(_pendingUrl))
+                {
+                    string pending = _pendingUrl;
+                    _pendingUrl = null;
+                    TryNavigate(pending);
+                }
+                else
+                {
+                    TryNavigate("https://www.bing.com/");
+                }
             }
             catch (Exception ex)
             {
                 _ready = false;
-                _labStatus.Text = "浏览器内核不可用：" + ex.Message;
+                _labStatus.Text = "浏览器内核不可用：" + ex.Message + "。可装 WebView2 运行库，或点“系统浏览器”打开。";
                 _btnSystem.Visible = true;
             }
         }
@@ -135,9 +161,22 @@ namespace PclDlGui
 
         private void TryNavigate(string url)
         {
-            if (!_ready || _web == null || _web.CoreWebView2 == null) { OpenExternal(url); return; }
-            try { _web.Source = new Uri(url); }
-            catch (Exception ex) { _labStatus.Text = "地址无效：" + ex.Message; }
+            if (!_ready || _web == null || _web.CoreWebView2 == null)
+            {
+                _pendingUrl = url;
+                _labStatus.Text = "浏览器内核还在启动，地址已记下，就绪后自动打开…";
+                return;
+            }
+            try
+            {
+                _pendingUrl = null;
+                _labStatus.Text = "正在打开：" + url;
+                _web.Source = new Uri(url);
+            }
+            catch (Exception ex)
+            {
+                _labStatus.Text = "地址无效：" + ex.Message + "（要带 http:// 或 https://）";
+            }
         }
 
         private void OpenExternal(string url)

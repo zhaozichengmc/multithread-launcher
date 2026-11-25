@@ -123,3 +123,12 @@ MC 窗口下方新增「账号 / Java / 内存 / 启动游戏」：
 - 有新版时弹窗显示更新说明，可「下载并更新」：下载该版本的单文件 exe →
   批处理等本进程退出后覆盖自身 → 重启，失败自动重试 12 次
 - 「打开发布页」直接跳到 `https://github.com/zhaozichengmc/multithread-launcher/releases`
+
+## 更新日志
+
+**V2.1（2026-11-25）**
+
+- 单文件版把 Newtonsoft.Json、WebView2 托管库全部内嵌（Costura），WebView2Loader.dll 释放到临时目录并加入 DLL 搜索路径，单独拷 exe 也能跑
+- 修复内置浏览器地址栏回车无效：内核未就绪时先缓存地址，就绪后自动打开
+- 修复 MC 下载闪退：完整版压缩包先前漏了 `Newtonsoft.Json.dll`，读版本清单就 `FileNotFoundException` 闪退
+- 新增崩溃兜底：`Application.ThreadException` + `AppDomain.UnhandledException` 写 `%APPDATA%\PCLDownloader\crash.log` 并弹窗，不再静默退出
