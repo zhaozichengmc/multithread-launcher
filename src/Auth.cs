@@ -87,7 +87,7 @@ namespace PclDlGui
                 {
                     var req = (HttpWebRequest)WebRequest.Create(url);
                     req.Method = method;
-                    req.UserAgent = "PCLDownloader/2.3";
+                    req.UserAgent = "PCLDownloader/2.4";
                     req.Timeout = 30000;
                     req.ReadWriteTimeout = 30000;
                     req.AllowAutoRedirect = true;

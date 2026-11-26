@@ -280,6 +280,156 @@ namespace PclDlGui
             throw new Exception("authlib-injector 下载失败：" + (last?.Message ?? "未知错误"));
         }
 
+        /// <summary>该实例的客户端 jar 在哪：自己目录有就用，没有就顺 inheritsFrom 往上找父版本的 jar</summary>
+        public static bool ResolveJar(string dir, string id, out string jarPath)
+        {
+            jarPath = null;
+            string cur = id;
+            for (int depth = 0; depth < 4 && !string.IsNullOrEmpty(cur); depth++)
+            {
+                string vd = Path.Combine(dir, "versions", cur);
+                string jar = Path.Combine(vd, cur + ".jar");
+                if (File.Exists(jar)) { jarPath = jar; return true; }
+                string js = Path.Combine(vd, cur + ".json");
+                if (!File.Exists(js)) return false;
+                string parent = null;
+                try { parent = (string)JObject.Parse(File.ReadAllText(js))["inheritsFrom"]; }
+                catch { return false; }
+                if (string.IsNullOrEmpty(parent)) return false;
+                cur = parent;
+            }
+            return false;
+        }
+
+        /// <summary>本地实例是否可启动：有 json，且能找到客户端 jar（含继承父版本）</summary>
+        public static bool IsInstalled(string dir, string id)
+        {
+            if (string.IsNullOrEmpty(dir) || string.IsNullOrEmpty(id)) return false;
+            string js = Path.Combine(dir, "versions", id, id + ".json");
+            if (!File.Exists(js)) return false;
+            string jar;
+            return ResolveJar(dir, id, out jar);
+        }
+
+        /// <summary>该实例需要的最低 Java 主版本（会顺 inheritsFrom 找父版本的 javaVersion）</summary>
+        public static int NeedJava(string dir, string id)
+        {
+            try { return (int?)(LoadMerged(dir, id)["javaVersion"]?["majorVersion"]) ?? 8; }
+            catch { return 8; }
+        }
+
+        /// <summary>把继承链（Forge / Fabric / 整合包）上的 json 合并成一份可启动的版本描述</summary>
+        private static JObject LoadMerged(string dir, string id)
+        {
+            var stack = new List<JObject>();
+            string cur = id;
+            for (int depth = 0; depth < 4 && !string.IsNullOrEmpty(cur); depth++)
+            {
+                string js = Path.Combine(dir, "versions", cur, cur + ".json");
+                if (!File.Exists(js)) break;
+                JObject j;
+                try { j = JObject.Parse(File.ReadAllText(js)); }
+                catch (Exception ex) { throw new Exception("版本 json 解析失败（" + cur + "）：" + ex.Message); }
+                stack.Add(j);
+                cur = (string)j["inheritsFrom"];
+            }
+            if (stack.Count == 0) throw new Exception("找不到版本 json：" + id);
+            JObject merged = (JObject)stack[stack.Count - 1].DeepClone();
+            for (int i = stack.Count - 2; i >= 0; i--)
+                merged = MergeVersion(merged, stack[i]);
+            return merged;
+        }
+
+        /// <summary>parent 作底、child 覆盖。libraries 按 name 合并，arguments 按 jvm/game 追加</summary>
+        private static JObject MergeVersion(JObject parent, JObject child)
+        {
+            var result = (JObject)parent.DeepClone();
+            foreach (var p in child.Properties())
+            {
+                if (p.Name == "libraries" && p.Value.Type == JTokenType.Array &&
+                    result["libraries"] != null && result["libraries"].Type == JTokenType.Array)
+                {
+                    var mergedLibs = new JArray();
+                    var keep = new Dictionary<string, JToken>(StringComparer.OrdinalIgnoreCase);
+                    foreach (var l in (JArray)result["libraries"])
+                    {
+                        string key = (string)l["name"];
+                        if (string.IsNullOrEmpty(key))
+                        {
+                            mergedLibs.Add(l.DeepClone());
+                            continue;
+                        }
+                        keep[key] = l;
+                        mergedLibs.Add(l.DeepClone());
+                    }
+                    foreach (var l in (JArray)p.Value)
+                    {
+                        string key = (string)l["name"];
+                        if (!string.IsNullOrEmpty(key) && keep.ContainsKey(key))
+                        {
+                            for (int i = mergedLibs.Count - 1; i >= 0; i--)
+                                if ((string)mergedLibs[i]["name"] == key) { mergedLibs.RemoveAt(i); break; }
+                        }
+                        mergedLibs.Add(l.DeepClone());
+                    }
+                    result["libraries"] = mergedLibs;
+                }
+                else if (p.Name == "arguments" && p.Value.Type == JTokenType.Object &&
+                         result["arguments"] != null && result["arguments"].Type == JTokenType.Object)
+                {
+                    var args = (JObject)result["arguments"];
+                    foreach (var ap in ((JObject)p.Value).Properties())
+                    {
+                        if (ap.Value.Type == JTokenType.Array && args[ap.Name] != null && args[ap.Name].Type == JTokenType.Array)
+                        {
+                            var comb = new JArray();
+                            foreach (var x in (JArray)args[ap.Name]) comb.Add(x.DeepClone());
+                            foreach (var x in (JArray)ap.Value) comb.Add(x.DeepClone());
+                            args[ap.Name] = comb;
+                        }
+                        else args[ap.Name] = ap.Value.DeepClone();
+                    }
+                }
+                else
+                {
+                    result[p.Name] = p.Value.DeepClone();
+                }
+            }
+            return result;
+        }
+
+        /// <summary>"group:artifact:version[:classifier]" → libraries 下的相对路径</summary>
+        private static string MavenToPath(string name)
+        {
+            if (string.IsNullOrEmpty(name)) return null;
+            var parts = name.Split(':');
+            if (parts.Length < 3) return null;
+            string group = parts[0], artifact = parts[1], version = parts[2];
+            string classifier = parts.Length > 3 ? parts[3] : null;
+            string file = artifact + "-" + version + (string.IsNullOrEmpty(classifier) ? "" : "-" + classifier) + ".jar";
+            return group.Replace('.', '/') + "/" + artifact + "/" + version + "/" + file;
+        }
+
+        /// <summary>natives 目录也顺着继承链找：整合包/Forge 子版本往往没有自己的 natives，只有父版本有</summary>
+        private static string ResolveNatives(string dir, string id, string fallback)
+        {
+            string cur = id;
+            for (int depth = 0; depth < 4 && !string.IsNullOrEmpty(cur); depth++)
+            {
+                string nd = Path.Combine(dir, "versions", cur, "natives");
+                try
+                {
+                    if (Directory.Exists(nd) && Directory.GetFiles(nd, "*.dll").Length > 0) return nd;
+                }
+                catch { }
+                string js = Path.Combine(dir, "versions", cur, cur + ".json");
+                if (!File.Exists(js)) break;
+                try { cur = (string)JObject.Parse(File.ReadAllText(js))["inheritsFrom"]; }
+                catch { break; }
+            }
+            return fallback;
+        }
+
         public static Process Launch(string id, string dir, Account acc, string javaExe, int memMb, Action<string> log)
         {
             var psi = Build(id, dir, acc, javaExe, memMb, log);
@@ -291,18 +441,20 @@ namespace PclDlGui
         {
             string versionDir = Path.Combine(dir, "versions", id);
             string jsonPath = Path.Combine(versionDir, id + ".json");
-            string jarPath = Path.Combine(versionDir, id + ".jar");
-            if (!File.Exists(jsonPath) || !File.Exists(jarPath))
-                throw new Exception("版本未安装完整：请先点“下载此版本”");
+            if (!File.Exists(jsonPath))
+                throw new Exception("找不到版本 json：" + jsonPath);
+            string jarPath;
+            if (!ResolveJar(dir, id, out jarPath))
+                throw new Exception("该实例缺少客户端 jar（也找不到继承的父版本 jar），请重新安装");
 
-            JObject v = JObject.Parse(File.ReadAllText(jsonPath));
+            JObject v = LoadMerged(dir, id);
             int needJava = (int?)(v["javaVersion"]?["majorVersion"]) ?? 8;
             int haveJava = JavaFinder.Version(javaExe);
             if (haveJava > 0 && haveJava < needJava)
                 throw new Exception("该版本需要 Java " + needJava + "，当前选中的是 Java " + haveJava + "。\n请安装或用“浏览”指定 java.exe。");
             if (haveJava == 0) throw new Exception("无法运行该 Java：路径不对或文件损坏");
 
-            string natives = Path.Combine(versionDir, "natives");
+            string natives = ResolveNatives(dir, id, Path.Combine(versionDir, "natives"));
             if (!Directory.Exists(natives)) Directory.CreateDirectory(natives);
             string libDir = Path.Combine(dir, "libraries");
             string assets = Path.Combine(dir, "assets");
@@ -316,11 +468,14 @@ namespace PclDlGui
                 {
                     bool ok = EvalRules(lib["rules"], out _);
                     if (!ok) continue;
+                    // Forge / Fabric 的 json 里很多库只写 maven 坐标（name），没有 downloads.artifact.path，
+                    // 以前直接 continue 会让 classpath 缺 mod 加载器 → 点启动就崩。
+                    string rel = null;
                     var art = lib["downloads"]?["artifact"];
-                    if (art == null) continue;
-                    string rel = (string)art["path"];
+                    if (art != null) rel = (string)art["path"];
+                    if (string.IsNullOrEmpty(rel)) rel = MavenToPath((string)lib["name"]);
                     if (string.IsNullOrEmpty(rel)) continue;
-                    if (rel.Contains("natives-windows")) continue; // 原生库不进 classpath
+                    if (rel.IndexOf("natives-windows", StringComparison.OrdinalIgnoreCase) >= 0) continue; // 原生库不进 classpath
                     string p = Path.Combine(libDir, rel.Replace('/', Path.DirectorySeparatorChar));
                     if (File.Exists(p)) cp.Add(p);
                     else log("警告：缺少支持库 " + rel);
@@ -348,7 +503,7 @@ namespace PclDlGui
                 { "auth_xuid", acc.Xuid ?? "" },
                 { "version_type", (string)v["type"] ?? "release" },
                 { "launcher_name", "PCLDownloader" },
-                { "launcher_version", "2.3" },
+                { "launcher_version", "2.4" },
                 { "resolution_width", "854" },
                 { "resolution_height", "480" },
                 { "natives_directory", natives },

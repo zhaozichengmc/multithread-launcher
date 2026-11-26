@@ -32,7 +32,7 @@ namespace PclDlGui
     /// </summary>
     public static class UpdateChecker
     {
-        public const string CurrentVersion = "2.3";
+        public const string CurrentVersion = "2.4";
         public const string Owner = "zhaozichengmc";
         public const string Repo = "multithread-launcher";
         public const string ReleasesPage = "https://github.com/" + Owner + "/" + Repo + "/releases";

@@ -20,10 +20,13 @@ namespace PclDlGui
         public string Type;
         public string Url;
         public string Time;
+        public bool Local;        // 本地 .minecraft/versions 里真实存在的实例
+        public bool Installed;    // 本地实例能找到客户端 jar（含继承父版本）
         public string TypeText
         {
             get
             {
+                if (Local) return Installed ? "本地实例" : "本地·缺 jar";
                 if (Type == "release") return "正式版";
                 if (Type == "snapshot") return "快照";
                 if (Type == "old_beta") return "Beta 远古";
@@ -71,7 +74,7 @@ namespace PclDlGui
 
             Controls.Add(new Label { Text = "版本类型", Left = 16, Top = 14, Width = 60, Height = 20 });
             cboType = new ComboBox { Left = 80, Top = 11, Width = 110, DropDownStyle = ComboBoxStyle.DropDownList };
-            cboType.Items.AddRange(new object[] { "全部", "正式版", "快照", "远古版本（Alpha/Beta）" });
+            cboType.Items.AddRange(new object[] { "全部", "正式版", "快照", "远古版本（Alpha/Beta）", "本地实例" });
             cboType.SelectedIndex = 0;
             cboType.SelectedIndexChanged += (s, e) => FillList();
             Controls.Add(cboType);
@@ -95,7 +98,12 @@ namespace PclDlGui
             lv.Columns.Add("版本", 320);
             lv.Columns.Add("类型", 120);
             lv.Columns.Add("发布时间", 200);
-            lv.DoubleClick += (s, e) => StartInstall();
+            lv.DoubleClick += (s, e) =>
+            {
+                var v = SelectedVersion();
+                if (v != null && v.Local) StartLaunch();   // 本地实例双击=启动，不去下载覆盖它
+                else StartInstall();
+            };
             Controls.Add(lv);
 
             Controls.Add(new Label { Text = "游戏目录", Left = 16, Top = 300, Width = 60, Height = 20 });
@@ -156,7 +164,27 @@ namespace PclDlGui
             Controls.Add(btnLaunch);
             Controls.Add(new Label { Left = 160, Top = 498, Width = 660, Height = 20, ForeColor = Color.DimGray, Text = "启动前会自动检测 Java；正版账号首次登录后无需重复登录", Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right });
 
-            Load += (s, e) => { LoadManifest(); LoadPrefs(); };
+            Load += (s, e) =>
+            {
+                // 默认目录没有实例时自动找一下，避免"本地有实例却显示未下载"
+                try
+                {
+                    if (!Directory.Exists(Path.Combine(txtDir.Text.Trim(), "versions")))
+                    {
+                        string found = DetectMcDir();
+                        if (!string.IsNullOrEmpty(found))
+                        {
+                            txtDir.Text = found;
+                            Log("默认目录里没有实例，已自动定位到：" + found);
+                        }
+                    }
+                }
+                catch { }
+                LoadPrefs();
+                FillList();
+                LoadManifest();
+            };
+            txtDir.Leave += (s, e) => { try { FillList(); } catch { } };
             lv.SelectedIndexChanged += (s, e) => UpdateLaunchButton();
             FormClosing += (s, e) =>
             {
@@ -227,7 +255,12 @@ namespace PclDlGui
             {
                 dlg.Description = "选择 .minecraft 目录";
                 if (Directory.Exists(txtDir.Text)) dlg.SelectedPath = txtDir.Text;
-                if (dlg.ShowDialog(this) == DialogResult.OK) txtDir.Text = dlg.SelectedPath;
+                if (dlg.ShowDialog(this) == DialogResult.OK)
+                {
+                    txtDir.Text = dlg.SelectedPath;
+                    FillList();   // 换目录后重新扫本地实例
+                    Log("已切换目录，检测到 " + ScanLocal().Count + " 个本地实例：" + dlg.SelectedPath);
+                }
             }
         }
 
@@ -286,20 +319,125 @@ namespace PclDlGui
             _worker.Start();
         }
 
+        /// <summary>
+        /// 扫本地 .minecraft/versions：只要目录里有 json 就算一个实例（Forge/Fabric/整合包都只有 json，
+        /// jar 可能继承父版本）。以前只认 &lt;id&gt;/&lt;id&gt;.jar，所以本地明明有实例也显示"未下载"。
+        /// </summary>
+        /// <summary>当前目录没有 versions 时，去常见位置/其他盘找真正的 .minecraft（只读扫描，不会改任何东西）</summary>
+        private static string DetectMcDir()
+        {
+            var cands = new List<string>();
+            try { cands.Add(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), ".minecraft")); } catch { }
+            try { cands.Add(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".minecraft")); } catch { }
+
+            var hits = new List<string>();
+            try
+            {
+                foreach (var d in DriveInfo.GetDrives())
+                {
+                    if (d.DriveType != DriveType.Fixed || !d.IsReady) continue;
+                    try
+                    {
+                        foreach (var sub in Directory.GetDirectories(d.RootDirectory.FullName))
+                        {
+                            string name = Path.GetFileName(sub).ToLowerInvariant();
+                            if (!name.Contains("minecraft") && name != "mc" && !name.StartsWith("pcl")) continue;
+                            if (Directory.Exists(Path.Combine(sub, "versions"))) hits.Add(sub);
+                            else
+                            {
+                                string inner = Path.Combine(sub, ".minecraft");
+                                if (Directory.Exists(Path.Combine(inner, "versions"))) hits.Add(inner);
+                            }
+                        }
+                    }
+                    catch { }
+                }
+            }
+            catch { }
+
+            foreach (var c in cands)
+                if (Directory.Exists(Path.Combine(c, "versions"))) return c;
+            return hits.Count > 0 ? hits[0] : null;
+        }
+
+        private List<McVersionInfo> ScanLocal()
+        {
+            var list = new List<McVersionInfo>();
+            string dir = txtDir.Text.Trim();
+            if (string.IsNullOrEmpty(dir)) return list;
+            string vdir = Path.Combine(dir, "versions");
+            if (!Directory.Exists(vdir)) return list;
+            try
+            {
+                foreach (var sub in Directory.GetDirectories(vdir))
+                {
+                    string id = Path.GetFileName(sub).Trim();
+                    if (string.IsNullOrEmpty(id)) continue;
+                    string js = Path.Combine(sub, id + ".json");
+                    if (!File.Exists(js))
+                    {
+                        // 少数启动器 json 文件名和文件夹名不一致，取目录里第一个 json 兜底
+                        string[] cand = Directory.GetFiles(sub, "*.json");
+                        if (cand.Length == 0) continue;
+                        Array.Sort(cand, StringComparer.OrdinalIgnoreCase);
+                        js = cand[0];
+                    }
+                    string type = "release";
+                    string inherits = null;
+                    try
+                    {
+                        var j = JObject.Parse(File.ReadAllText(js));
+                        type = (string)j["type"] ?? type;
+                        inherits = (string)j["inheritsFrom"];
+                    }
+                    catch { continue; }
+
+                    bool installed;
+                    try { installed = Launcher.IsInstalled(dir, id); } catch { installed = false; }
+                    string t = "";
+                    try { t = File.GetLastWriteTime(js).ToString("yyyy-MM-dd HH:mm"); } catch { }
+                    list.Add(new McVersionInfo
+                    {
+                        Id = id,
+                        Type = type,
+                        Time = string.IsNullOrEmpty(inherits) ? t : t + "（继承 " + inherits + "）",
+                        Local = true,
+                        Installed = installed
+                    });
+                }
+            }
+            catch { }
+            list.Sort((a, b) => (b.Installed ? 1 : 0) - (a.Installed ? 1 : 0));
+            return list;
+        }
+
         private void FillList()
         {
             lv.Items.Clear();
             int mode = cboType.SelectedIndex;
+
+            // 本地实例永远排在最前，再用远程清单补全（同 id 以本地为准）
+            var locals = ScanLocal();
+            var localIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var l in locals) localIds.Add(l.Id);
+
+            var src = new List<McVersionInfo>();
+            src.AddRange(locals);
+            var remote = new List<McVersionInfo>();
+            foreach (var v in _versions)
+                if (!localIds.Contains(v.Id)) remote.Add(v);
+            if (cboSort != null && cboSort.SelectedIndex == 1) remote.Reverse();
+            src.AddRange(remote);
+
             int n = 0;
-            var src = new List<McVersionInfo>(_versions);
-            if (cboSort != null && cboSort.SelectedIndex == 1) src.Reverse();
             foreach (var v in src)
             {
                 bool ok;
-                if (mode == 0) ok = true;
-                else if (mode == 1) ok = v.Type == "release";
-                else if (mode == 2) ok = v.Type == "snapshot";
-                else ok = v.Type == "old_alpha" || v.Type == "old_beta";
+                if (mode == 4) ok = v.Local;
+                else if (mode == 1) ok = !v.Local && v.Type == "release";
+                else if (mode == 2) ok = !v.Local && v.Type == "snapshot";
+                else if (mode == 3) ok = !v.Local && (v.Type == "old_alpha" || v.Type == "old_beta");
+                else ok = true;
                 if (!ok) continue;
                 var item = new ListViewItem(new[] { v.Id, v.TypeText, v.Time });
                 item.Tag = v;
@@ -310,6 +448,7 @@ namespace PclDlGui
             lv.SelectedItems.Clear();
             if (lv.Items.Count > 0) lv.Items[0].Selected = true;
             btnStart.Enabled = !_busy && lv.SelectedItems.Count > 0;
+            UpdateLaunchButton();
         }
 
         private volatile bool _busy;
@@ -323,6 +462,13 @@ namespace PclDlGui
             var v = lv.SelectedItems[0].Tag as McVersionInfo;
             string dir = txtDir.Text.Trim();
             if (string.IsNullOrEmpty(dir)) { Log("先填游戏目录"); return; }
+            if (v.Local)
+            {
+                if (v.Installed) { Log("本地已有实例 " + v.Id + "，直接点“启动游戏”就行"); return; }
+                Log("本地实例 " + v.Id + " 只有 json、缺客户端 jar。想补原版文件请选清单里的同名原版版本下载，"
+                    + "整合包的 jar 需要你放回 versions\\" + v.Id + " 目录。");
+                return;
+            }
 
             _busy = true;
             btnStart.Enabled = false;
@@ -343,6 +489,7 @@ namespace PclDlGui
                         if (IsDisposed || Disposing) return;
                         SetStatus("完成：" + v.Id + " 已下载到 " + dir, 1000);
                         Log("完成。用 PCL2 / HMCL 选择该目录即可启动。");
+                        FillList();   // 立刻把刚装好的版本标成"本地实例"，可以直接点启动
                     });
                 }
                 catch (Exception ex)
@@ -460,10 +607,12 @@ namespace PclDlGui
             bool installed = false;
             if (v != null)
             {
-                string jar = Path.Combine(txtDir.Text.Trim(), "versions", v.Id, v.Id + ".jar");
-                installed = File.Exists(jar);
+                try { installed = Launcher.IsInstalled(txtDir.Text.Trim(), v.Id); }
+                catch { installed = false; }
             }
-            btnLaunch.Text = installed ? "启动游戏" : "启动（未安装）";
+            if (installed) btnLaunch.Text = "启动游戏";
+            else if (v != null && v.Local) btnLaunch.Text = "启动（缺 jar）";
+            else btnLaunch.Text = "启动（未安装）";
             btnLaunch.Enabled = !_busy;
         }
 
@@ -472,8 +621,15 @@ namespace PclDlGui
             var v = SelectedVersion();
             if (v == null) { Log("先选一个版本"); return; }
             string dir = txtDir.Text.Trim();
-            string jar = Path.Combine(dir, "versions", v.Id, v.Id + ".jar");
-            if (!File.Exists(jar)) { Log("该版本还没下载完，先点“下载此版本”"); return; }
+            if (!Launcher.IsInstalled(dir, v.Id))
+            {
+                if (v.Local)
+                    Log("本地实例 " + v.Id + " 有 json 但找不到客户端 jar（也找不到它继承的父版本），启动器无法启动它。"
+                        + "如果这是整合包，请检查 .minecraft\\versions\\" + v.Id + " 下是否有 " + v.Id + ".jar 或父版本目录。");
+                else
+                    Log("该版本还没下载完，先点“下载此版本”");
+                return;
+            }
 
             _account = AccountStore.Load();
             if (string.IsNullOrEmpty(_account.Name))
@@ -483,17 +639,7 @@ namespace PclDlGui
                 if (string.IsNullOrEmpty(_account.Name)) return;
             }
 
-            int needJava = 8;
-            try
-            {
-                string vj = Path.Combine(dir, "versions", v.Id, v.Id + ".json");
-                if (File.Exists(vj))
-                {
-                    var jo = Newtonsoft.Json.Linq.JObject.Parse(File.ReadAllText(vj));
-                    needJava = (int?)(jo["javaVersion"]?["majorVersion"]) ?? 8;
-                }
-            }
-            catch { }
+            int needJava = Launcher.NeedJava(dir, v.Id);
 
             string java = txtJava.Text.Trim();
             int have = (!string.IsNullOrEmpty(java) && File.Exists(java)) ? JavaFinder.Version(java) : 0;
@@ -924,7 +1070,7 @@ namespace PclDlGui
         internal static void FetchToFile(string url, string path)
         {
             var req = (HttpWebRequest)WebRequest.Create(url);
-            req.UserAgent = "PCLDownloader/2.3";
+            req.UserAgent = "PCLDownloader/2.4";
             req.Timeout = 15000;
             req.ReadWriteTimeout = 20000;
             req.AllowAutoRedirect = true;
@@ -981,7 +1127,7 @@ namespace PclDlGui
                 {
                     // WebClient 无超时，镜像站挂住时会永远转圈
                     var req = (HttpWebRequest)WebRequest.Create(url);
-                    req.UserAgent = "PCLDownloader/2.3";
+                    req.UserAgent = "PCLDownloader/2.4";
                     req.Timeout = 10000;
                     req.ReadWriteTimeout = 15000;
                     req.AllowAutoRedirect = true;

@@ -126,6 +126,16 @@ MC 窗口下方新增「账号 / Java / 内存 / 启动游戏」：
 
 ## 更新日志
 
+**V2.4（2026-11-26）— 本地实例识别与继承链启动**
+
+- **本地实例不再误判未下载**：检测从"必须有 `<id>.jar`"改为"有 json 且 jar 可沿 `inheritsFrom` 解析"，Forge/Fabric/整合包都能识别
+- **版本列表加「本地实例」筛选**：本地实例置顶显示，双击直接启动；「下载此版本」对本地已装实例不再重复下载
+- **游戏目录自动定位**：默认 `.minecraft` 没有 versions 时，自动扫描 `%APPDATA%\.minecraft`、用户目录与其他盘的 `*minecraft*` 目录
+- **启动支持版本继承**：`inheritsFrom` 链上合并 libraries（按 name 去重）、`arguments.jvm/game`（追加）、`assetIndex`/`assets`/`javaVersion`
+- **classpath 兼容 maven 坐标**：Forge 那种只写 `name` 没有 `downloads.artifact.path` 的库，按 `group:artifact:version` 换算路径
+- **natives 沿继承链回退**：子版本没有 natives 目录时使用父版本已解压的 dll，避免启动时 UnsatisfiedLinkError
+- **Java 版本判断**：改为读取合并后的 `javaVersion`，子版本不写也能拿到父版本要求
+
 **V2.3（2026-11-26）— 再挖一轮并全部修掉**
 
 - **失败不再死循环**：调度器以前会立刻把 `Failed` 当 `Idle` 重新拉起，404 地址等于无限重试；现在失败态必须用户手动重试
