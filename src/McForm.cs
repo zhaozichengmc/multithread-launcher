@@ -519,21 +519,21 @@ namespace PclDlGui
                     if (acc.Type == "ms")
                     {
                         try { acc = Auth.MsRefresh(acc, s => Log(s)); AccountStore.Save(acc); _account = acc; }
-                        catch (Exception ex) { Log("正版令牌刷新失败：" + ex.Message + "，请重新登录"); BeginInvoke((Action)(() => OpenAccount())); return; }
+                        catch (Exception ex) { Log("正版令牌刷新失败：" + ex.Message + "，请重新登录"); Ui(() => OpenAccount()); btnLaunch.Enabled = true; return; }
                     }
                     else if (acc.Type == "third")
                     {
                         try { if (!Auth.ThirdValidate(acc)) { acc = Auth.ThirdRefresh(acc); AccountStore.Save(acc); _account = acc; } }
-                        catch (Exception ex) { Log("第三方令牌失效：" + ex.Message + "，请重新登录"); BeginInvoke((Action)(() => OpenAccount())); return; }
+                        catch (Exception ex) { Log("第三方令牌失效：" + ex.Message + "，请重新登录"); Ui(() => OpenAccount()); btnLaunch.Enabled = true; return; }
                     }
                     if (needJava <= 8 && have >= 9)
                 Log("提示：该老版本建议用 Java 8，当前 Java " + have + " 可能启动失败");
             var p = Launcher.Launch(ver.Id, dir, acc, java, mem, s => Log(s));
-                    BeginInvoke((Action)(() => { Log("游戏进程已启动（PID " + p.Id + "）"); btnLaunch.Enabled = true; }));
+                    Ui(() => { Log("游戏进程已启动（PID " + p.Id + "）"); btnLaunch.Enabled = true; });
                 }
                 catch (Exception ex)
                 {
-                    BeginInvoke((Action)(() => { Log("启动失败：" + ex.Message); btnLaunch.Enabled = true; }));
+                    Ui(() => { Log("启动失败：" + ex.Message); btnLaunch.Enabled = true; });
                 }
             });
             th.IsBackground = true;
@@ -596,7 +596,8 @@ namespace PclDlGui
             string jarPath = Path.Combine(versionsDir, Id + ".jar");
             long jarSize = L(root["downloads"]?["client"]?["size"]);
             string jarOfficial = (string)(root["downloads"]?["client"]?["url"] ?? "");
-            DownloadWithEngine(Bmcl + "/version/" + Id + "/client", jarOfficial, jarPath, jarSize);
+            DownloadWithEngine(Bmcl + "/version/" + Id + "/client", jarOfficial, jarPath, jarSize,
+                (string)root["downloads"]?["client"]?["sha1"]);
             Log("客户端 jar 完成：" + new FileInfo(jarPath).Length / 1048576 + " MB");
 
             // ---------- 支持库 ----------
@@ -761,6 +762,8 @@ namespace PclDlGui
                 Task.WaitAll(tasks.ToArray());
             }
             Log("资源文件完成：" + doneAssets + "/" + totalAssets + "，失败 " + failed);
+            if (failed > 0)
+                throw new Exception("有 " + failed + " 个资源文件没下成功，游戏会缺材质/音效。再点一次“下载此版本”会自动补下（已下好的不重下）");
 
             // ---------- 日志配置 ----------
             try
@@ -831,13 +834,15 @@ namespace PclDlGui
                 .Replace("https://piston-meta.mojang.com", Bmcl + "/maven");
         }
 
-        private bool DownloadWithEngine(string url, string fallback, string path, long size)
+        private bool DownloadWithEngine(string url, string fallback, string path, long size, string sha1 = null)
         {
             CheckCancel();
             if (File.Exists(path))
             {
                 long len = new FileInfo(path).Length;
-                if (size <= 0 || len == size) return true;
+                // jar 这类大文件光比大小不够，镜像返回同长坏包时会一直"装好了但启动不了"
+                if ((size <= 0 || len == size) && (string.IsNullOrEmpty(sha1) || Sha1Of(path) == sha1.ToLowerInvariant()))
+                    return true;
                 try { File.Delete(path); } catch { }
             }
             Directory.CreateDirectory(Path.GetDirectoryName(path));
@@ -856,9 +861,17 @@ namespace PclDlGui
                     if (Cancel) { dl.Cancel(); break; }
                     Thread.Sleep(80);
                 }
-                if (dl.State == DlState.Finished) return true;
-                if (use == url) MirrorFailed();
-                last = new Exception(dl.State == DlState.Cancelled ? "已取消" : "下载失败：" + url);
+                if (dl.State == DlState.Finished)
+                {
+                    if (!string.IsNullOrEmpty(sha1) && Sha1Of(path) != sha1.ToLowerInvariant())
+                    {
+                        try { File.Delete(path); } catch { }
+                        last = new Exception("下载到的文件 SHA-1 不对（镜像可能给了错包）");
+                        MirrorFailed();
+                    }
+                    else return true;
+                }
+                else { if (use == url) MirrorFailed(); last = new Exception(dl.State == DlState.Cancelled ? "已取消" : "下载失败：" + url); }
                 if (Cancel) break;
                 Thread.Sleep(1000 * (attempt + 1));
             }
@@ -885,13 +898,9 @@ namespace PclDlGui
                 string tmp = path + ".tmp";
                 try
                 {
-                    using (var wc = new WebClient())
-                    {
-                        wc.Headers["User-Agent"] = "PCLDownloader/1.0";
-                        string use = Pick(url, fallback, attempt);
-                        wc.DownloadFile(use, tmp);
-                        if (use == url && MirrorDown == false && attempt > 0) { /* 成功即恢复 */ }
-                    }
+                    string use = Pick(url, fallback, attempt);
+                    // WebClient 没有超时：镜像站卡住时会永远停在"正在下载资源"。改用手动请求，带读写超时
+                    FetchToFile(use, tmp);
                     long len = new FileInfo(tmp).Length;
                     if (size > 0 && len != size) throw new Exception("大小不符（期望 " + size + "，实际 " + len + "）");
                     // assets 按 SHA-1 命名，只比大小会放过内容错的镜像响应
@@ -910,6 +919,23 @@ namespace PclDlGui
                 }
             }
             throw last ?? new Exception("下载失败：" + url);
+        }
+
+        internal static void FetchToFile(string url, string path)
+        {
+            var req = (HttpWebRequest)WebRequest.Create(url);
+            req.UserAgent = "PCLDownloader/2.3";
+            req.Timeout = 15000;
+            req.ReadWriteTimeout = 20000;
+            req.AllowAutoRedirect = true;
+            using (var resp = (HttpWebResponse)req.GetResponse())
+            using (var s = resp.GetResponseStream())
+            using (var fs = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.None))
+            {
+                byte[] buf = new byte[81920];
+                int n;
+                while ((n = s.Read(buf, 0, buf.Length)) > 0) fs.Write(buf, 0, n);
+            }
         }
 
         internal static string Sha1Of(string path)
@@ -953,12 +979,15 @@ namespace PclDlGui
             {
                 try
                 {
-                    using (var wc = new WebClient())
-                    {
-                        wc.Headers["User-Agent"] = "PCLDownloader/1.0";
-                        wc.Encoding = Encoding.UTF8;
-                        return wc.DownloadString(url);
-                    }
+                    // WebClient 无超时，镜像站挂住时会永远转圈
+                    var req = (HttpWebRequest)WebRequest.Create(url);
+                    req.UserAgent = "PCLDownloader/2.3";
+                    req.Timeout = 10000;
+                    req.ReadWriteTimeout = 15000;
+                    req.AllowAutoRedirect = true;
+                    using (var resp = (HttpWebResponse)req.GetResponse())
+                    using (var sr = new StreamReader(resp.GetResponseStream(), Encoding.UTF8))
+                        return sr.ReadToEnd();
                 }
                 catch (Exception ex) { last = ex; Thread.Sleep(500 * (i + 1)); }
             }

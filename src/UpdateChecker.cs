@@ -22,6 +22,7 @@ namespace PclDlGui
         public string ExeUrl;      // 该版本里最适合直接替换的单文件 exe
         public string ExeName;
         public long ExeSize;
+        public string ExeDigest;   // GitHub 资源摘要，形如 sha256:xxxx，用于校验而不是只看大小
         public bool IsNewer;
     }
 
@@ -31,7 +32,7 @@ namespace PclDlGui
     /// </summary>
     public static class UpdateChecker
     {
-        public const string CurrentVersion = "2.2";
+        public const string CurrentVersion = "2.3";
         public const string Owner = "zhaozichengmc";
         public const string Repo = "multithread-launcher";
         public const string ReleasesPage = "https://github.com/" + Owner + "/" + Repo + "/releases";
@@ -96,6 +97,7 @@ namespace PclDlGui
                             info.ExeName = n;
                             info.ExeUrl = Str(a["browser_download_url"]);
                             info.ExeSize = a["size"] != null ? a["size"].Value<long>() : 0;
+                            info.ExeDigest = Str(a["digest"]);
                             break;
                         }
                     }
@@ -151,6 +153,8 @@ namespace PclDlGui
         /// <summary>下载更新包到临时目录，返回本地文件路径（带超时，并校验真的是 exe）</summary>
         public static string DownloadExe(ReleaseInfo info, Action<int> progress)
         {
+            if (string.IsNullOrEmpty(info.ExeUrl))
+                throw new Exception("这个版本没有挂单文件 exe，请到发布页手动下载完整包");
             string dir = Path.Combine(Path.GetTempPath(), "LightspeedUpdate");
             Directory.CreateDirectory(dir);
             string dest = Path.Combine(dir, info.ExeName ?? "LightspeedDownloader.exe");
@@ -164,7 +168,7 @@ namespace PclDlGui
                 try
                 {
                     DownloadTo(url, tmp, info.ExeSize, progress);
-                    ValidateExe(tmp, info.ExeSize);
+                    ValidateExe(tmp, info.ExeSize, info.ExeDigest);
                     if (File.Exists(dest)) File.Delete(dest);
                     File.Move(tmp, dest);
                     return dest;
@@ -214,7 +218,7 @@ namespace PclDlGui
         }
 
         /// <summary>防止把 429 的 JSON / 代理 HTML 错误页当成更新包覆盖掉自己</summary>
-        private static void ValidateExe(string path, long expectSize)
+        private static void ValidateExe(string path, long expectSize, string digest)
         {
             var fi = new FileInfo(path);
             if (fi.Length < 100000)
@@ -226,6 +230,26 @@ namespace PclDlGui
                 byte[] head = new byte[2];
                 if (fs.Read(head, 0, 2) != 2 || head[0] != (byte)'M' || head[1] != (byte)'Z')
                     throw new Exception("下载到的不是有效的 exe（文件头不对）");
+            }
+            // GitHub 会给每个资源一个 digest，有就用它算真哈希；只看大小挡不住"同样长度但内容被换"的情况
+            if (!string.IsNullOrEmpty(digest) && digest.StartsWith("sha256:", StringComparison.OrdinalIgnoreCase))
+            {
+                string want = digest.Substring(7).Trim().ToLowerInvariant();
+                string got = Sha256Of(path);
+                if (want != got)
+                    throw new Exception("更新包 SHA-256 与发布页不一致（可能被代理替换）");
+            }
+        }
+
+        private static string Sha256Of(string path)
+        {
+            using (var sha = System.Security.Cryptography.SHA256.Create())
+            using (var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read))
+            {
+                var h = sha.ComputeHash(fs);
+                var sb = new StringBuilder(h.Length * 2);
+                foreach (var b in h) sb.Append(b.ToString("x2"));
+                return sb.ToString();
             }
         }
 
@@ -254,7 +278,8 @@ namespace PclDlGui
                 "timeout /t 1 /nobreak >nul\r\n" +
                 "del /f /q \"" + bat + "\"\r\n";
 
-            File.WriteAllText(bat, script, new UTF8Encoding(true));
+            // 纯 ASCII 脚本，不能带 BOM：cmd.exe 会把 BOM 粘在第一行，导致 @echo off 变成非法命令
+            File.WriteAllText(bat, script, new UTF8Encoding(false));
             var psi = new ProcessStartInfo("cmd.exe", "/c \"\"" + bat + "\"\"")
             {
                 UseShellExecute = false,

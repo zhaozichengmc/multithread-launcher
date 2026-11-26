@@ -266,11 +266,10 @@ namespace PclDlGui
                     string url = (string)j["download_url"];
                     if (string.IsNullOrEmpty(url)) continue;
                     string tmp = jar + ".tmp";
-                    using (var wc = new WebClient())
-                    {
-                        wc.Headers["User-Agent"] = "PCLDownloader/2.3";
-                        wc.DownloadFile(url, tmp);
-                    }
+                    // WebClient 无超时，authlib 站挂住会把"启动游戏"卡死在这里
+                    McInstaller.FetchToFile(url, tmp);
+                    if (!File.Exists(tmp) || new FileInfo(tmp).Length < 100000)
+                        throw new Exception("下载到的 authlib-injector 不是有效 jar");
                     if (File.Exists(jar)) File.Delete(jar);
                     File.Move(tmp, jar);
                     log("authlib-injector 已就绪：" + Path.GetFileName(jar));
@@ -402,6 +401,8 @@ namespace PclDlGui
             }
 
             string mainClass = (string)v["mainClass"];
+            if (string.IsNullOrEmpty(mainClass))
+                throw new Exception("版本 json 里没有 mainClass，安装文件可能不完整");
             args.Add(mainClass);
 
             if (v["minecraftArguments"] != null)

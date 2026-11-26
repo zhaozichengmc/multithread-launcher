@@ -133,9 +133,17 @@ namespace PclDl
             string rss = FindValue(raw, new[] { "接收方缩放", "receive scaling", "rss" });
             string ts = FindValue(raw, new[] { "时间戳", "timestamp" });
 
-            if (auto != null) _auto = NormalizeAuto(auto);
-            if (rss != null) _rss = NormalizeOnOff(rss);
-            if (ts != null) _ts = NormalizeOnOff(ts);
+            // 三个值必须都认出来才敢改：以前某个值没解析到就退回默认值，
+            // 还原时会照着"默认值"写回去，把用户原本的设置改错。
+            if (auto == null || rss == null || ts == null)
+            {
+                if (log != null) log("网络调优：读不到完整的 TCP 全局参数，跳过本次调优（不改动系统设置）");
+                return false;
+            }
+
+            _auto = NormalizeAuto(auto);
+            _rss = NormalizeOnOff(rss);
+            _ts = NormalizeOnOff(ts);
 
             _captured = true;
             if (log != null) log("网络调优：当前 autotuning=" + _auto + "，rss=" + _rss + "，timestamps=" + _ts);
@@ -170,12 +178,22 @@ namespace PclDl
 
                 using (var p = Process.Start(psi))
                 {
-                    output = p.StandardOutput.ReadToEnd() + p.StandardError.ReadToEnd();
+                    // 以前是先 ReadToEnd 再 WaitForExit：netsh 卡住时 ReadToEnd 永远不返回，超时形同虚设
+                    var sb = new StringBuilder();
+                    var gate = new object();
+                    p.OutputDataReceived += (s, e) => { if (e.Data != null) lock (gate) sb.AppendLine(e.Data); };
+                    p.ErrorDataReceived += (s, e) => { if (e.Data != null) lock (gate) sb.AppendLine(e.Data); };
+                    p.BeginOutputReadLine();
+                    p.BeginErrorReadLine();
+
                     if (!p.WaitForExit(15000))
                     {
                         try { p.Kill(); } catch { }
+                        output = "netsh 超时未返回";
                         return -1;
                     }
+                    try { p.WaitForExit(); } catch { }   // 等异步读取把剩余输出冲干净
+                    lock (gate) output = sb.ToString();
                     return p.ExitCode;
                 }
             }

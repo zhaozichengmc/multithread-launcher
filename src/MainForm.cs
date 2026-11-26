@@ -39,6 +39,7 @@ namespace PclDlGui
         private NotifyIcon _tray;
         private Timer _timer;
         private bool _exiting;
+        private bool _tipShown;
 
         public MainForm(string[] args)
         {
@@ -98,6 +99,9 @@ namespace PclDlGui
                 {
                     e.Cancel = true;
                     HideToTray();
+                    // 直接消失会让人以为程序崩了：给一次气泡提示
+                    try { if (_tray != null && !_tipShown) { _tipShown = true; _tray.ShowBalloonTip(3000, "还在下载", "已最小化到托盘，双击图标恢复；右键可暂停或退出。", ToolTipIcon.Info); } }
+                    catch { }
                     return;
                 }
                 SaveQueue();
@@ -550,7 +554,9 @@ namespace PclDlGui
             {
                 if (_active >= max) break;
                 if (t.Running || t.State == DlState.Finished) continue;
-                if (t.State != DlState.Idle && t.State != DlState.Failed && t.State != DlState.Cancelled) continue;
+                // 只自动拉起"等待开始"的任务。失败/取消必须等用户点重试，
+                // 否则 404 之类的地址会变成无间隔死循环重试，把日志刷爆。
+                if (t.State != DlState.Idle) continue;
                 StartTask(t);
             }
             UpdateSummary();
@@ -561,6 +567,7 @@ namespace PclDlGui
             t.Running = true;
             t.State = DlState.Probing;
             t.Message = "正在探测…";
+            _afterDone = false;   // 有任务重新开跑，自动关机/休眠的"已结束"闸门要复位
 
             var dl = new MultiThreadDownloader(t.Url, t.Path, t.Threads, chkDns.Checked)
             {
@@ -614,6 +621,11 @@ namespace PclDlGui
                 UpdateButtons();
                 RunScheduler();
                 CheckAllDone();
+            }
+            else if (_allPaused && p.State == DlState.Downloading && t.Dl != null)
+            {
+                // "暂停全部"之后才开始的任务，探测阶段跑完会自己进入下载，这里要补一刀
+                t.Dl.Pause();
             }
             UpdateSummary();
         }
@@ -677,8 +689,13 @@ namespace PclDlGui
 
         private void CancelAll()
         {
+            bool keepPartial = _exiting;   // 退出程序时保留已下载的分块，下次打开能接着下
             foreach (var t in _tasks)
-                if (t.Dl != null) t.Dl.Cancel();
+                if (t.Dl != null)
+                {
+                    if (keepPartial) t.Dl.CancelDeletesFiles = false;
+                    t.Dl.Cancel();
+                }
             _allPaused = false;
             btnPauseAll.Text = "暂停全部";
         }
@@ -749,6 +766,13 @@ namespace PclDlGui
             if (t.Running) { t.Dl.Cancel(); return; }
             lv.Items.Remove(t.Row);
             _tasks.Remove(t);
+            // 取消后保留的分块文件，用户把任务删了就该一起清掉，不然磁盘越攒越多
+            if (t.Dl != null) t.Dl.DiscardPartial();
+            else
+            {
+                try { if (File.Exists(t.Path + ".pdlstate")) File.Delete(t.Path + ".pdlstate"); } catch { }
+                try { if (File.Exists(t.Path + ".part")) File.Delete(t.Path + ".part"); } catch { }
+            }
             SaveQueue();
             UpdateSummary();
         }
@@ -876,7 +900,9 @@ namespace PclDlGui
                     if (info.IsNewer)
                     {
                         Log("发现新版本 " + info.Tag + "（当前 " + UpdateChecker.CurrentVersion + "）");
-                        using (var f = new UpdateForm(info, true)) f.ShowDialog(this);
+                        if (btnUpdate != null) btnUpdate.Text = "更新 " + info.Tag;
+                        // 后台静默检查不该弹窗打断用户，只在按钮上挂个提示，点它才进更新窗
+                        if (!silent) using (var f = new UpdateForm(info, true)) f.ShowDialog(this);
                     }
                     else
                     {
@@ -1011,9 +1037,17 @@ namespace PclDlGui
 
         private void Ui(Action a)
         {
-            if (IsDisposed) return;
-            if (InvokeRequired) BeginInvoke(a);
-            else a();
+            // 关窗瞬间句柄可能已经销毁：BeginInvoke 会抛 ObjectDisposedException，
+            // 而调用方多在后台线程，异常没人接就会让整个进程消失。
+            if (a == null) return;
+            if (IsDisposed || !IsHandleCreated) return;
+            try
+            {
+                if (InvokeRequired) BeginInvoke(new Action(() => { try { a(); } catch { } }));
+                else { try { a(); } catch { } }
+            }
+            catch (ObjectDisposedException) { }
+            catch (InvalidOperationException) { }
         }
 
         // ================= 队列持久化 =================

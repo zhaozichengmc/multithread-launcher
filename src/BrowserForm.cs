@@ -23,6 +23,7 @@ namespace PclDlGui
         private Label _labStatus;
         private Button _btnSystem;
         private bool _ready;
+        private bool _initFailed;
         private string _pendingUrl;
 
         public BrowserForm(Action<string, string, string> onDownload)
@@ -155,6 +156,7 @@ namespace PclDlGui
             catch (Exception ex)
             {
                 _ready = false;
+                _initFailed = true;
                 if (IsDisposed || Disposing) return;
                 if (_labStatus != null)
                     _labStatus.Text = "浏览器内核不可用：" + ex.Message + "。可装 WebView2 运行库，或点“系统浏览器”打开。";
@@ -181,25 +183,32 @@ namespace PclDlGui
             if (!_ready || _web == null || _web.CoreWebView2 == null)
             {
                 _pendingUrl = url;
-                _labStatus.Text = "浏览器内核还在启动，地址已记下，就绪后自动打开…";
+                if (_initFailed)
+                {
+                    // 内核起不来时以前只会一直显示"还在启动"，用户按回车像没反应
+                    if (_labStatus != null) _labStatus.Text = "浏览器内核不可用，已改用系统浏览器打开：" + url;
+                    OpenExternal(url);
+                    return;
+                }
+                if (_labStatus != null) _labStatus.Text = "浏览器内核还在启动，地址已记下，就绪后自动打开…";
                 return;
             }
             try
             {
                 _pendingUrl = null;
-                _labStatus.Text = "正在打开：" + url;
+                if (_labStatus != null) _labStatus.Text = "正在打开：" + url;
                 _web.Source = new Uri(url);
             }
             catch (Exception ex)
             {
-                _labStatus.Text = "地址无效：" + ex.Message + "（要带 http:// 或 https://）";
+                if (_labStatus != null) _labStatus.Text = "地址无效：" + ex.Message + "（要带 http:// 或 https://）";
             }
         }
 
         private void OpenExternal(string url)
         {
             try { Process.Start(url); }
-            catch (Exception ex) { _labStatus.Text = "打开系统浏览器失败：" + ex.Message; }
+            catch (Exception ex) { if (_labStatus != null) _labStatus.Text = "打开系统浏览器失败：" + ex.Message; }
         }
 
         /// <summary>把当前页面地址当成下载链接入队（有些站点是“页面即文件”的直链）</summary>
@@ -234,8 +243,16 @@ namespace PclDlGui
         {
             string uri = "";
             try { uri = e.DownloadOperation.Uri; } catch { }
-            e.Cancel = true;
             if (string.IsNullOrEmpty(uri)) { Ui(() => { if (_labStatus != null) _labStatus.Text = "拦截到一个下载，但拿不到地址"; }); return; }
+
+            // blob:/data: 这类地址我们的下载引擎拿不到，交给 WebView2 自己下，别把用户的下载吃掉
+            if (!uri.StartsWith("http://", StringComparison.OrdinalIgnoreCase) &&
+                !uri.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
+            {
+                Ui(() => { if (_labStatus != null) _labStatus.Text = "非 http 链接，交给内置浏览器自行下载：" + uri; });
+                return;
+            }
+            e.Cancel = true;
 
             string referer = "";
             string cookie = "";

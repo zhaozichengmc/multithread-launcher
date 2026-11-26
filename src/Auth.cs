@@ -231,7 +231,18 @@ namespace PclDlGui
 
             // 2) XSTS
             string xstsBody = "{\"Properties\":{\"SandboxId\":\"RETAIL\",\"UserTokens\":[\"" + xblToken + "\"]},\"RpsTicket\":\"" + xblToken + "\",\"TokenType\":\"JWT\"}";
-            string xstsJson = Http.PostJson("https://xsts.auth.xboxlive.com/xsts/authorize", xstsBody);
+            string xstsJson;
+            try { xstsJson = Http.PostJson("https://xsts.auth.xboxlive.com/xsts/authorize", xstsBody); }
+            catch (Exception ex)
+            {
+                // XSTS 的报错是带 XErr 的 JSON，直接把原文给用户等于看不懂
+                string m = ex.Message ?? "";
+                if (m.Contains("2148916233")) throw new Exception("这个微软账号还没有 Xbox 档案，请先在 xbox.com 登录一次再回来");
+                if (m.Contains("2148916235")) throw new Exception("该账号所在地区不支持 Xbox Live（需要换区或换账号）");
+                if (m.Contains("2148916238")) throw new Exception("未成年账号需要家长在微软家庭组里批准后才能登录");
+                if (m.Contains("2148916227")) throw new Exception("该微软账号已被 Xbox Live 封禁");
+                throw new Exception("Xbox 身份验证失败：" + m);
+            }
             var xsts = JObject.Parse(xstsJson);
             string xstsToken = (string)xsts["Token"];
             string uhs2 = (string)xsts["DisplayClaims"]?["xui"]?[0]?["uhs"] ?? uhs;
@@ -322,7 +333,27 @@ namespace PclDlGui
 
         private static string Escape(string s)
         {
-            return (s ?? "").Replace("\\", "\\\\").Replace("\"", "\\\"");
+            if (s == null) return "";
+            var sb = new StringBuilder(s.Length + 8);
+            foreach (char c in s)
+            {
+                switch (c)
+                {
+                    case '\\': sb.Append("\\\\"); break;
+                    case '"': sb.Append("\\\""); break;
+                    case '\n': sb.Append("\\n"); break;
+                    case '\r': sb.Append("\\r"); break;
+                    case '\t': sb.Append("\\t"); break;
+                    case '\b': sb.Append("\\b"); break;
+                    case '\f': sb.Append("\\f"); break;
+                    default:
+                        // 其余控制字符也必须转义，否则拼出来的 JSON 直接非法
+                        if (c < 0x20) sb.Append("\\u").Append(((int)c).ToString("x4"));
+                        else sb.Append(c);
+                        break;
+                }
+            }
+            return sb.ToString();
         }
     }
 }

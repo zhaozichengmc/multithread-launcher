@@ -7,7 +7,7 @@
     <LangVersion>latest</LangVersion>
     <AssemblyName>PCLDownloader</AssemblyName>
     <RootNamespace>PclDlGui</RootNamespace>
-    <Version>2.2.0</Version>
+    <Version>2.3.0</Version>
     <Product>光速下载器</Product>
     <AssemblyTitle>光速下载器</AssemblyTitle>
     <Description>基于动态分块的多线程下载工具，内置网页浏览器与在线更新</Description>

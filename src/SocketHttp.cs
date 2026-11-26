@@ -48,34 +48,58 @@ namespace PclDl
 
         public string Name { get { return "HTTP 客户端"; } }
 
+        // 以前每次 Fetch 都 new 一个 HttpClient + handler，从不释放：一个 16 线程任务重试几轮
+        // 就会堆出几十套连接池和 socket。现在按"代理配置"缓存复用。
+        private static readonly object _clientLock = new object();
+        private static readonly Dictionary<string, HttpClient> _clients = new Dictionary<string, HttpClient>();
+
+        private HttpClient GetClient()
+        {
+            string key = Proxy != null && Proxy.Valid
+                ? (Proxy.Host + ":" + Proxy.Port + "|" + (Proxy.User ?? ""))
+                : "direct";
+            lock (_clientLock)
+            {
+                HttpClient c;
+                if (_clients.TryGetValue(key, out c)) return c;
+
+                var handler = new HttpClientHandler
+                {
+                    AllowAutoRedirect = true,
+                    UseProxy = true,
+                    // 压缩只在"非 Range"请求里开，否则解压后字节数和 Content-Range 对不上
+                    AutomaticDecompression = DecompressionMethods.GZip | DecompressionMethods.Deflate
+                };
+                if (Proxy != null && Proxy.Valid)
+                {
+                    handler.Proxy = new WebProxy(Proxy.Host, Proxy.Port);
+                    if (!string.IsNullOrEmpty(Proxy.User))
+                        handler.Proxy.Credentials = new NetworkCredential(Proxy.User, Proxy.Pass);
+                }
+                c = new HttpClient(handler) { Timeout = System.Threading.Timeout.InfiniteTimeSpan };
+                c.DefaultRequestHeaders.UserAgent.ParseAdd(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36");
+                c.DefaultRequestHeaders.Accept.ParseAdd("*/*");
+                _clients[key] = c;
+                return c;
+            }
+        }
+
         public FetchResult Fetch(string url, long? from, long? to)
         {
             ServicePointManager.DefaultConnectionLimit = 1024;
             ServicePointManager.UseNagleAlgorithm = false;
             ServicePointManager.Expect100Continue = false;
 
-            var handler = new HttpClientHandler
-            {
-                AllowAutoRedirect = true,
-                AutomaticDecompression = DecompressionMethods.GZip | DecompressionMethods.Deflate,
-                UseProxy = true
-            };
-
-            if (Proxy != null && Proxy.Valid)
-            {
-                handler.Proxy = new WebProxy(Proxy.Host, Proxy.Port);
-                if (!string.IsNullOrEmpty(Proxy.User))
-                    handler.Proxy.Credentials = new NetworkCredential(Proxy.User, Proxy.Pass);
-                handler.UseProxy = true;
-            }
-            var client = new HttpClient(handler) { Timeout = TimeSpan.FromMilliseconds(Timeout.Infinite) };
-            client.DefaultRequestHeaders.UserAgent.ParseAdd(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36");
-            client.DefaultRequestHeaders.Accept.ParseAdd("*/*");
+            var client = GetClient();
 
             var req = new HttpRequestMessage(HttpMethod.Get, url);
             if (from.HasValue)
+            {
                 req.Headers.Range = new RangeHeaderValue(from.Value, to);
+                // 分段请求禁止压缩，避免解压后和 Range 偏移错位
+                req.Headers.AcceptEncoding.Add(new StringWithQualityHeaderValue("identity"));
+            }
 
             foreach (var kv in Headers)
             {

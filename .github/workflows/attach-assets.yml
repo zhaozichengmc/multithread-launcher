@@ -1,14 +1,12 @@
-name: Attach release assets
+name: Publish release assets
 
-# 网页上传接口对云端 IP 一直返回 500，改由 GitHub 自己的 runner 用 GITHUB_TOKEN 挂附件。
-# 同时支持 push dist/ 自动触发（网页的 workflow_dispatch 按钮有时报 "Workflow could not be run"）。
+# 网页端 Release 附件上传对云端 IP 经常 500/503，这里交给 GitHub runner：
+# 只要 push 了 dist/LightspeedDownloader-V<版本>.exe 与 -full.zip，就自动
+#   1) 从文件名推断版本号 → 标签 V<版本>
+#   2) 该标签不存在就创建 Release（正文取 dist/NOTES.md）
+#   3) 删掉同名旧附件后重新上传（避免 HTTP 422 already exists）
 on:
   workflow_dispatch:
-    inputs:
-      tag:
-        description: "目标 Release 标签，例如 V2.2"
-        required: true
-        default: "V2.2"
   push:
     paths:
       - "dist/**"
@@ -17,27 +15,51 @@ permissions:
   contents: write
 
 jobs:
-  attach:
+  publish:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Upload assets to release
+      - name: Publish assets
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          INPUT_TAG: ${{ github.event.inputs.tag }}
         run: |
-          set -e
-          TAG="${INPUT_TAG:-V2.2}"
-          ls -l dist
-          VER="${TAG#V}"
-          echo "tag=$TAG ver=$VER"
+          set -euo pipefail
+          ls -l dist || true
           shopt -s nullglob
-          files=()
-          for f in dist/*"$VER"*; do files+=("$f"); done
-          if [ ${#files[@]} -eq 0 ]; then echo "no files for $VER"; exit 1; fi
-          for f in "${files[@]}"; do
-            echo "uploading $f"
-            gh release upload "$TAG" "$f" --clobber
+          exes=(dist/LightspeedDownloader-V*.exe)
+          if [ ${#exes[@]} -eq 0 ]; then echo "dist 里没有 exe"; exit 1; fi
+          # 多份时取版本号最大的那份（sort -V）
+          latest=$(printf '%s\n' "${exes[@]}" | sort -V | tail -1)
+          echo "latest=$latest"
+          VER=$(basename "$latest" .exe | sed -E 's/^LightspeedDownloader-V([0-9.]+)$/\1/')
+          if [ -z "$VER" ]; then echo "文件名里读不出版本号"; exit 1; fi
+          TAG="V$VER"
+          ZIP="dist/LightspeedDownloader-V${VER}-full.zip"
+          echo "tag=$TAG ver=$VER"
+
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            echo "创建 Release $TAG"
+            if [ -f dist/NOTES.md ]; then
+              gh release create "$TAG" --title "光速下载器 $TAG" --notes-file dist/NOTES.md
+            else
+              gh release create "$TAG" --title "光速下载器 $TAG" --notes "光速下载器 $TAG"
+            fi
+          fi
+
+          # 先删同名附件，否则 gh release upload 会 422 already exists
+          ids=$(gh release view "$TAG" --json assets --jq '.assets[] | "\(.id) \(.name)"' || true)
+          for f in "$latest" "$ZIP" dist/README.txt; do
+            [ -f "$f" ] || continue
+            name=$(basename "$f")
+            id=$(echo "$ids" | awk -v n="$name" '$2==n {print $1}' | head -1)
+            if [ -n "${id:-}" ]; then
+              echo "删除旧附件 $name ($id)"
+              gh api -X DELETE "repos/${{ github.repository }}/releases/assets/$id" >/dev/null
+            fi
+            echo "上传 $name"
+            gh release upload "$TAG" "$f"
           done
-          gh release view "$TAG" --json assets --jq '.assets[].name'
+
+          echo "当前附件："
+          gh release view "$TAG" --json assets --jq '.assets[] | "\(.name) \(.size)"'

@@ -138,13 +138,23 @@ namespace PclDl
 
         private long _speed;
         private Thread _runThread;
+        private volatile bool _supervisorAlive;
         private volatile bool _singleMode;
         private long _singleDone;
 
         /// <summary>探测后确定的主源（镜像切换时以它为基准）</summary>
         private string _baseUrl;
 
+        /// <summary>取消时是否删掉已下载的分块/临时文件。程序退出前置 false，下次可续传</summary>
+        public bool CancelDeletesFiles = true;
+
         public DlState State { get; private set; }
+
+        /// <summary>删掉本任务留下的临时文件与断点状态（把任务从队列移除时调用）</summary>
+        public void DiscardPartial()
+        {
+            try { CleanUp(true); } catch { }
+        }
 
         // 单调时钟：Environment.TickCount 49.7 天会溢出成负数，速度和超时全乱
         private static readonly long ClockBase = Stopwatch.GetTimestamp();
@@ -254,6 +264,12 @@ namespace PclDl
         {
             if (_http is SocketTransport)
             {
+                if (Proxy != null && Proxy.Valid && Proxy.Socks5)
+                {
+                    // HttpClient 只认 HTTP 代理，切成它就等于把 SOCKS5 当成 HTTP 代理连，越换越坏
+                    Log("SOCKS5 通道出错（" + why + "），保持自建通道继续重试");
+                    return;
+                }
                 _http = new HttpClientTransport();
                 Configure(_http);
                 Log("DNS 优选通道不可用（" + why + "），已回退系统通道");
@@ -266,6 +282,7 @@ namespace PclDl
         {
             if (_runThread != null) return;
             BuildClients();
+            _supervisorAlive = true;
             _runThread = new Thread(Run);
             _runThread.IsBackground = true;
             _runThread.Name = "下载调度";
@@ -282,7 +299,10 @@ namespace PclDl
         public void Resume()
         {
             if (State != DlState.Paused) return;
+            // 调度线程可能还没真正退出（刚报完 Paused 就点继续），再起一条会两个调度器抢同一批分块
+            if (_supervisorAlive) { Log("调度线程还在收尾，请稍后再点继续"); return; }
             _pause = false;
+            _supervisorAlive = true;
             _runThread = new Thread(ResumeRun);
             _runThread.IsBackground = true;
             _runThread.Name = "下载调度";
@@ -320,7 +340,7 @@ namespace PclDl
                 Probe();
                 _baseUrl = Url;
 
-                if (_cancel) { CleanUp(true); Report(DlState.Cancelled, "已取消"); return; }
+                if (_cancel) { CleanUp(CancelDeletesFiles); Report(DlState.Cancelled, "已取消"); return; }
 
                 if (!_rangeSupported || _unknownSize || _totalSize < NoSplitSize || MaxThreads == 1)
                 {
@@ -358,9 +378,10 @@ namespace PclDl
             }
             catch (Exception ex)
             {
-                if (_cancel) { CleanUp(true); Report(DlState.Cancelled, "已取消"); }
+                if (_cancel) { CleanUp(CancelDeletesFiles); Report(DlState.Cancelled, "已取消"); }
                 else { CleanUp(false); Log("失败：" + ex.Message); Report(DlState.Failed, ex.Message); }
             }
+            finally { _supervisorAlive = false; }
         }
 
         private void ResumeRun()
@@ -387,9 +408,10 @@ namespace PclDl
             }
             catch (Exception ex)
             {
-                if (_cancel) { CleanUp(true); Report(DlState.Cancelled, "已取消"); }
+                if (_cancel) { CleanUp(CancelDeletesFiles); Report(DlState.Cancelled, "已取消"); }
                 else { CleanUp(false); Log("失败：" + ex.Message); Report(DlState.Failed, ex.Message); }
             }
+            finally { _supervisorAlive = false; }
         }
 
         /// <summary>
@@ -496,6 +518,14 @@ namespace PclDl
         private static string Sanitize(string name)
         {
             foreach (char c in Path.GetInvalidFileNameChars()) name = name.Replace(c, '_');
+            // Windows 不允许文件名以点或空格结尾，也禁止 CON/NUL 这类设备名
+            name = name.TrimEnd('.', ' ');
+            if (name.Length == 0) return "download.bin";
+            string stem = Path.GetFileNameWithoutExtension(name).ToUpperInvariant();
+            string[] reserved = { "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9" };
+            foreach (var r in reserved)
+                if (stem == r) return "_" + name;
+            if (name.Length > 200) name = name.Substring(0, 200);
             return name;
         }
 
@@ -621,10 +651,29 @@ namespace PclDl
                     if (!long.TryParse(p[0], out st) || !long.TryParse(p[1], out en) || !long.TryParse(p[2], out dn)) return false;
                     if (st != expectStart || en < st || dn < 0 || dn > en - st + 1) return false;
                     string temp = p[4];
-                    if (!File.Exists(temp)) return false;
-                    long len = new FileInfo(temp).Length;
-                    if (len < dn) return false;
-                    if (len > dn)
+                    long len;
+                    if (!File.Exists(temp))
+                    {
+                        // 还没开始写的分块本来就没有临时文件；以前这里直接 return false，
+                        // 只要有一段没落地，整份进度就被丢掉重下。
+                        if (dn > 0) return false;
+                        try
+                        {
+                            string td = Path.GetDirectoryName(temp);
+                            if (!string.IsNullOrEmpty(td)) Directory.CreateDirectory(td);
+                            File.WriteAllBytes(temp, new byte[0]);
+                        }
+                        catch { return false; }
+                        len = 0;
+                    }
+                    else len = new FileInfo(temp).Length;
+
+                    if (len < dn)
+                    {
+                        // 文件比计数短：说明上次写完还没来得及计数就中断了，按实际长度算进度（前缀一定有效）
+                        dn = len;
+                    }
+                    else if (len > dn)
                     {
                         // 上次写多了（写完没来得及计数），截到计数位置，避免重复字节
                         using (var fs = new FileStream(temp, FileMode.Open, FileAccess.Write, FileShare.Read))
@@ -666,15 +715,8 @@ namespace PclDl
                 if (_cancel)
                 {
                     WaitWorkers();
-                    if (AllSegmentsDone())
-                    {
-                        Report(DlState.Merging, "正在合并分块…");
-                        Merge();
-                        Report(DlState.Finished, "下载完成");
-                        Log("下载完成：" + SavePath);
-                        return;
-                    }
-                    CleanUp(true);
+                    // 用户点了取消，就算数据已经拉满也别再合并出文件：保持"取消=不留产物"的直觉
+                    CleanUp(CancelDeletesFiles);
                     Report(DlState.Cancelled, "已取消");
                     return;
                 }
@@ -682,7 +724,7 @@ namespace PclDl
                 if (_pause)
                 {
                     WaitWorkers();
-                    if (_cancel) { CleanUp(true); Report(DlState.Cancelled, "已取消"); return; }
+                    if (_cancel) { CleanUp(CancelDeletesFiles); Report(DlState.Cancelled, "已取消"); return; }
                     UpdateSpeedSampling(ref lastSample, ref lastDone);
                     _speed = 0;
                     SaveState();
@@ -731,7 +773,7 @@ namespace PclDl
 
             if (!AllSegmentsDone())
             {
-                if (_cancel) { CleanUp(true); Report(DlState.Cancelled, "已取消"); return; }
+                if (_cancel) { CleanUp(CancelDeletesFiles); Report(DlState.Cancelled, "已取消"); return; }
                 throw new Exception(_fatalMsg ?? "分块数据不完整");
             }
 
@@ -955,16 +997,22 @@ namespace PclDl
 
             using (resp)
             {
+                bool fullBody = false;
                 if (resp.Status != 206)
                 {
-                    if (resp.Status == 200)
+                    // 很多服务器对"bytes=0-整份"的请求直接回 200 全量（尤其 CDN/OSS）。
+                    // 只要请求的正好是完整文件，就当成整份下载，不要误判成"不支持分段"。
+                    long segEnd0 = Interlocked.Read(ref seg.End);
+                    if (resp.Status == 200 && from == 0 && _totalSize > 0 && segEnd0 == _totalSize - 1)
+                        fullBody = true;
+                    else if (resp.Status == 200)
                         throw new Exception("服务器忽略了 Range 请求（返回 200），该地址无法分块下载");
-                    throw new Exception("HTTP " + resp.Status);
+                    else
+                        throw new Exception("HTTP " + resp.Status);
                 }
-
                 long expect = to - from + 1;
                 long gotLen = resp.ContentLength;
-                if (gotLen > 0 && gotLen != expect && from == seg.Start && expect == _totalSize)
+                if (!fullBody && gotLen > 0 && gotLen != expect && from == seg.Start && expect == _totalSize)
                     throw new Exception(string.Format("文件大小与探测不一致：期望 {0}，实际 {1}", expect, gotLen));
 
                 var stream = resp.Body;
@@ -1023,7 +1071,7 @@ namespace PclDl
 
             while (done < _totalSize || _unknownSize)
             {
-                if (_cancel) { CleanUp(true); Report(DlState.Cancelled, "已取消"); return; }
+                if (_cancel) { CleanUp(CancelDeletesFiles); Report(DlState.Cancelled, "已取消"); return; }
 
                 FetchResult resp;
                 try
@@ -1083,7 +1131,7 @@ namespace PclDl
                     finally { fs.Dispose(); stream.Dispose(); }
                 }
 
-                if (_cancel) { CleanUp(true); Report(DlState.Cancelled, "已取消"); return; }
+                if (_cancel) { CleanUp(CancelDeletesFiles); Report(DlState.Cancelled, "已取消"); return; }
                 if (_pause) break;
                 if (!_unknownSize && done >= _totalSize) break;
                 if (!_rangeSupported) break;
@@ -1105,7 +1153,12 @@ namespace PclDl
             if (File.Exists(SavePath)) File.Delete(SavePath);
             File.Move(part, SavePath);
             if (_unknownSize) _totalSize = done;
-            VerifyFinished();
+            try { VerifyFinished(); }
+            catch
+            {
+                try { if (File.Exists(SavePath)) File.Delete(SavePath); } catch { }
+                throw;
+            }
             Report(DlState.Finished, "下载完成");
             Log("下载完成：" + SavePath);
         }
@@ -1157,7 +1210,13 @@ namespace PclDl
 
             if (File.Exists(SavePath)) File.Delete(SavePath);
             File.Move(tmpOut, SavePath);
-            VerifyFinished();
+            try { VerifyFinished(); }
+            catch
+            {
+                // 校验不过就删掉，别把坏文件留在用户目录里让人误以为下好了
+                try { if (File.Exists(SavePath)) File.Delete(SavePath); } catch { }
+                throw;
+            }
 
             foreach (var seg in ordered)
             {
